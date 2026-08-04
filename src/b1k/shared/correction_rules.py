@@ -260,22 +260,20 @@ def apply_correction_rules(
 ) -> Tuple[np.ndarray, int]:
     """
     Apply correction rules for the given task_id.
-    
+
     Rules are applied in order until one matches:
     1. Task-specific rules (e.g., radio's special stage 4 handling)
     2. General rules (e.g., gripper correction policies)
-    
+
     Only the first matching rule is applied per call.
-    
-    Args:
-        task_id: Current task ID
-        stage: Current stage
-        state: Current state (23-dim)
-        actions: Predicted actions (horizon, 23)
-    
-    Returns:
-        (actions, stage) - corrected or original if no rule applies
+
+    Note: the ALWAYS_OPEN sets, MIN_STAGE_FOR_CLOSURE, and TASK_SPECIFIC_RULES were
+    hand-curated for the 2025 challenge (tasks 0..49). For 2026-only tasks (50..99) we
+    short-circuit here — no rules apply until they're re-authored for the new task set.
     """
+    if not (0 <= task_id < 50):
+        return actions, stage
+
     # Try task-specific rules first
     task_specific_rules = TASK_SPECIFIC_RULES.get(task_id, [])
     for rule in task_specific_rules:

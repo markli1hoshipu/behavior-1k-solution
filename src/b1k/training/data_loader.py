@@ -31,6 +31,29 @@ from b1k.models.observation import Observation
 from b1k.transforms_normalize import NormalizeWithPerTimestamp
 
 
+from lerobot.datasets.lerobot_dataset import LeRobotDataset as _LeRobotDataset
+
+
+class B1kLeRobotDataset(_LeRobotDataset):
+    """LeRobotDataset subclass fixing the episode-filter off-by-index bug in v3.
+
+    When `episodes=` is supplied, LeRobot rebuilds `episode_data_index` compactly
+    (size = len(episodes)) but `__getitem__` still reads `episode_index` from the
+    parquet with its ORIGINAL global value, so the lookup crashes for filters that
+    aren't `range(0, N)`. This subclass remaps global → compact position first.
+
+    Using a subclass (rather than a monkeypatch) means the fix travels with the
+    instance through pickle → DataLoader workers pick it up automatically.
+    """
+
+    def _get_query_indices(self, idx, ep_idx):
+        if getattr(self, "episodes", None) is not None:
+            if not hasattr(self, "_b1k_ep_idx_map"):
+                self._b1k_ep_idx_map = {int(ep): i for i, ep in enumerate(self.episodes)}
+            ep_idx = self._b1k_ep_idx_map.get(int(ep_idx), int(ep_idx))
+        return super()._get_query_indices(idx, ep_idx)
+
+
 class DataLoaderImpl(DataLoader):
     """Custom DataLoader using our Observation with fast_tokens."""
     
@@ -59,12 +82,16 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
     Returns:
         Dataset instance with BEHAVIOR-1K data
     """
-    from omnigibson.learning.datas.lerobot_dataset import BehaviorLeRobotDataset
-    
-    # Use random seed if not provided
+    # Use our subclass that fixes the LeRobot v3 episode-filter bug (defined at module scope
+    # so pickle can restore it in DataLoader workers regardless of start-method).
+    LeRobotDataset = B1kLeRobotDataset
+
     if seed is None:
         seed = int(time.time() * 1000) % (2**32)
-        logging.info(f"Using random seed for BehaviorLeRobotDataset: {seed}")
+        logging.info(f"Using random seed for LeRobotDataset: {seed}")
+
+    # Task-name list (kept for reference/logging; no longer used as a filter — episodes
+    # are selected via data_config.episodes_index which is more precise.)
     tasks = [
     "picking_up_trash", # difficulty: 2
     "putting_away_Halloween_decorations", # difficulty: 3
@@ -118,19 +145,17 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
     "freeze_pies",
     ]
     
-    dataset = BehaviorLeRobotDataset(
+    dataset = LeRobotDataset(
         repo_id=data_config.repo_id,
         root=data_config.behavior_dataset_root,
-        tasks=tasks,
-        modalities=["rgb"],
-        local_only=True,
+        episodes=data_config.episodes_index,
         delta_timestamps={
             key: [t / 30.0 for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
-        episodes=data_config.episodes_index,
-        chunk_streaming_using_keyframe=False,
-        shuffle=True,
-        seed=seed,
+        # Standard LeRobot loader — leaves task-name filtering / annotation loading to
+        # our downstream transforms (task_index is present in the parquet).
+        tolerance_s=0.1,
+        video_backend="pyav",  # pyav is more forgiving on ffmpeg shared lib version mismatches
     )
 
     if data_config.prompt_from_task:
@@ -166,22 +191,11 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
         ),
     ]
     
-    # Add subtask state computation for PI_BEHAVIOR models (needs dataset reference)
-    model_transforms = []
-    for transform in data_config.model_transforms.inputs:
-        # ComputeSubtaskStateFromMeta needs dataset reference to access episode lengths
-        if hasattr(transform, '__class__') and transform.__class__.__name__ == 'ComputeSubtaskStateFromMeta':
-            # Replace placeholder with dataset-aware version
-            from b1k import transforms as b1k_transforms
-            if hasattr(dataset, 'meta') and hasattr(dataset.meta, 'episodes'):
-                model_transforms.append(b1k_transforms.ComputeSubtaskStateFromMeta(dataset=dataset))
-                logging.info("Added dataset-aware ComputeSubtaskStateFromMeta transform")
-            else:
-                logging.warning("Skipping subtask state computation - dataset has no meta.episodes")
-        else:
-            model_transforms.append(transform)
-    
-    transforms_list.extend(model_transforms)
+    # B1a: annotation-based skill labels + progress are computed by
+    # AnnotateSkillFromAnnotation, which reads per-episode annotation JSONs directly
+    # from the annotations_dir set in the DataConfig — no dataset reference needed.
+    # (The old ComputeSubtaskStateFromMeta injection is retired.)
+    transforms_list.extend(data_config.model_transforms.inputs)
 
     return TransformedDataset(dataset, transforms_list)
 

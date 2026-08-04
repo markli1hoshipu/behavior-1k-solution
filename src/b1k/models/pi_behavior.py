@@ -23,10 +23,8 @@ from openpi.shared import array_typing as at
 from b1k.models import pi_behavior_config
 from b1k.models.observation import Observation, preprocess_observation
 from b1k.models.pi_behavior_config import (
-    TASK_NUM_STAGES, 
-    MAX_NUM_STAGES, 
-    TOTAL_TASK_STAGE_EMBEDDINGS, 
-    TASK_STAGE_OFFSETS
+    NUM_SKILLS,
+    SKILL_ID_LUT,
 )
 
 logger = logging.getLogger("b1k")
@@ -136,31 +134,31 @@ class PiBehavior(_model.BaseModel):
         else:
             self.kv_transform = None
         
-        # Task embeddings table - trainable embeddings for each task
+        # Task embeddings table - trainable embeddings for each task (100 for 2026 set)
         self.task_embeddings = nnx.Embed(
             num_embeddings=config.num_tasks,
             features=config.task_embedding_dim,
             rngs=rngs,
         )
-        
-        # Stage predictor - predicts stage from VLM output of base task token
-        # Outputs MAX_NUM_STAGES logits, but invalid stages are masked per task
-        self.stage_pred_from_vlm = nnx.Linear(paligemma_config.width, MAX_NUM_STAGES, rngs=rngs)
-        
-        # Task + subtask fusion layers
-        # Combines task embedding + cos/sin encoded subtask state
-        self.subtask_encoding_dim = config.task_embedding_dim // 2  # Half of task embedding dim (1024)
-        
-        # Task-specific stage embeddings (one per stage per task)
-        # Total embeddings = sum of stages across all tasks (596 for 5-15 stages per task)
-        self.task_stage_embeddings = nnx.Embed(
-            num_embeddings=TOTAL_TASK_STAGE_EMBEDDINGS,
+
+        # Skill predictor: from base_task VLM output -> NUM_SKILLS logits.
+        # Replaces the old stage_pred_from_vlm (which output MAX_NUM_STAGES=15 per-task-relative
+        # bins). The target is now a global skill_idx from SKILL_ID_LUT.
+        self.skill_pred_from_vlm = nnx.Linear(paligemma_config.width, NUM_SKILLS, rngs=rngs)
+
+        # Fusion layers (same shape as before, but the "stage" side now uses skill embeddings)
+        self.subtask_encoding_dim = config.task_embedding_dim // 2  # 1024
+
+        # Global skill embeddings (B1a): NUM_SKILLS=34 entries, shared across tasks so
+        # "grasp" means the same thing in task 5 and task 50. Replaces per-task
+        # task_stage_embeddings (was 596 rows keyed by task-relative stage index).
+        self.skill_embeddings = nnx.Embed(
+            num_embeddings=NUM_SKILLS,
             features=self.subtask_encoding_dim,
             rngs=rngs,
         )
-        
-        # Gated fusion layers
-        # Input: task_embedding + sincos + task_stage_emb = task_dim + 2*subtask_dim
+
+        # Input to gates/fusion: task_emb (2048) + sincos(progress) (1024) + skill_emb (1024) = 4096
         fusion_input_dim = config.task_embedding_dim + 2 * self.subtask_encoding_dim
         
         # Gate networks to learn how to combine different signals
@@ -219,35 +217,22 @@ class PiBehavior(_model.BaseModel):
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True
 
-    def encode_subtask_state(
-        self, 
-        subtask_state: at.Int[at.Array, " b"],
-        task_ids: at.Int[at.Array, " b"]
+    def encode_progress(
+        self,
+        subtask_progress: at.Float[at.Array, " b"],
     ) -> at.Float[at.Array, "b {self.subtask_encoding_dim}"]:
-        """Encode subtask state using cos/sin positional encoding, scaled per task.
-        
-        Args:
-            subtask_state: Current stage for each sample [B]
-            task_ids: Task ID for each sample [B]
-            
-        Returns:
-            Positional encodings scaled to [0, 1] range based on task-specific stage count [B, 1024]
+        """Sin/cos encode continuous per-frame progress in [0, 1].
+
+        Replaces the old per-task-stage sincos, which normalized a discrete stage_idx by
+        the task's hardcoded TASK_NUM_STAGES. Now the caller supplies current_frame /
+        episode_length directly (smoother signal, task-agnostic).
         """
-        # Get number of stages for each task in batch using JAX array indexing
-        # Convert tuple to JAX array inside function to avoid import-time device allocation
-        task_num_stages_array = jnp.array(TASK_NUM_STAGES, dtype=jnp.int32)
-        task_num_stages = task_num_stages_array[task_ids]  # [B] - JAX array indexing
-        
-        # Normalize: stage 0 → 0.0, last stage → 1.0 (per-task scaling)
-        # Add maximum to avoid division by zero for edge cases
-        normalized_state = subtask_state.astype(jnp.float32) / jnp.maximum(task_num_stages.astype(jnp.float32) - 1.0, 1.0)
-        
-        # Use cos/sin encoding similar to timestep encoding
+        progress = jnp.clip(subtask_progress.astype(jnp.float32), 0.0, 1.0)
         return posemb_sincos(
-            normalized_state, 
-            self.subtask_encoding_dim, 
-            min_period=1e-3, 
-            max_period=1.0
+            progress,
+            self.subtask_encoding_dim,
+            min_period=1e-3,
+            max_period=1.0,
         )
 
     def load_correlation_matrix(self, norm_stats: dict):
@@ -450,71 +435,52 @@ class PiBehavior(_model.BaseModel):
         }
 
     def fuse_task_and_subtask(
-        self, task_embedding: at.Float[at.Array, "b d"], task_ids: at.Int[at.Array, " b"], subtask_state: at.Int[at.Array, " b"]
+        self,
+        task_embedding: at.Float[at.Array, "b d"],
+        skill_idx: at.Int[at.Array, " b"],
+        subtask_progress: at.Float[at.Array, " b"],
     ) -> at.Float[at.Array, "b n d"]:
-        """Fuse task embedding with subtask state encoding using multiple representations.
-        
-        Returns multiple vectors that are differently conditioned by the subtask state:
-        1. Task-gated representation (task embedding modulated by subtask)
-        2. Balanced fusion (task + subtask combined)
-        3. Stage-dominant representation (subtask features projected to task space)
-        4. Pure stage representation (concatenated learned embeddings)
-        
-        All output representations have dimension 2048 (task_embedding_dim).
-        
-        Args:
-            task_embedding: Base task embedding [b, 2048]
-            task_ids: Task IDs for task-specific stage embeddings [b]
-            subtask_state: Subtask state indices [b]
-            
-        Returns:
-            Multiple fused embeddings [b, 4, 2048]
+        """Fuse task_embedding with (skill_embedding, progress-sincos) via gated mixing.
+
+        B1a semantics:
+        - "sincos" side = per-frame progress in [0, 1]
+        - "task_stage" side (renamed skill) = global 34-entry skill_embeddings[skill_idx]
+
+        The four output representations preserve the original shape [b, 4, 2048] so the
+        surrounding attention layout and stage-prediction indexing stay unchanged.
         """
-        # Get subtask representations
-        sincos_encoding = self.encode_subtask_state(subtask_state, task_ids)  # [b, 1024]
-        
-        # Task-specific stage embedding with corrected indexing
-        # Use vectorized lookup: offset + stage for each task
-        # Convert tuple to JAX array inside function to avoid import-time device allocation
-        task_stage_offsets_array = jnp.array(TASK_STAGE_OFFSETS, dtype=jnp.int32)
-        task_stage_offsets = task_stage_offsets_array[task_ids]  # [b] - JAX array indexing
-        task_stage_idx = task_stage_offsets + subtask_state  # [b]
-        task_stage_embedding = self.task_stage_embeddings(task_stage_idx)  # [b, 1024]
-        
-        # Concatenate inputs for gating: task (2048) + sincos (1024) + task_stage (1024) = 4096
+        # Progress sincos (was: sincos of stage_idx / TASK_NUM_STAGES[task])
+        sincos_encoding = self.encode_progress(subtask_progress)  # [b, 1024]
+
+        # Global skill embedding lookup (was: per-task task_stage_embeddings[offset+stage])
+        skill_embedding = self.skill_embeddings(skill_idx)  # [b, 1024]
+
+        # Concat inputs: task (2048) + sincos (1024) + skill (1024) = 4096
         all_inputs = jnp.concatenate([
-            task_embedding,       # [b, 2048]
-            sincos_encoding,      # [b, 1024]
-            task_stage_embedding  # [b, 1024]
+            task_embedding,     # [b, 2048]
+            sincos_encoding,    # [b, 1024]
+            skill_embedding,    # [b, 1024]
         ], axis=-1)  # [b, 4096]
-        
-        # Learn gates for each component (sigmoid to get 0-1 scaling)
-        gate_sincos = nnx.sigmoid(self.gate_sincos(all_inputs))      # [b, 1024]
-        gate_task_stage = nnx.sigmoid(self.gate_task_stage(all_inputs))  # [b, 1024]
-        gate_task = nnx.sigmoid(self.gate_task(all_inputs))          # [b, 2048]
-        
-        # 1. Task-gated representation: task embedding modulated by subtask info [b, 2048]
-        task_gated = task_embedding * gate_task
-        
-        # 2. Balanced fusion: combine all signals through fusion network [b, 2048]
-        x = self.fusion_layer1(all_inputs)  # [b, 4096]
+
+        gate_sincos = nnx.sigmoid(self.gate_sincos(all_inputs))          # [b, 1024]
+        gate_task_stage = nnx.sigmoid(self.gate_task_stage(all_inputs))  # [b, 1024]  (now gates skill)
+        gate_task = nnx.sigmoid(self.gate_task(all_inputs))              # [b, 2048]
+
+        task_gated = task_embedding * gate_task  # [b, 2048]
+
+        x = self.fusion_layer1(all_inputs)
         x = nnx.relu(x)
         balanced_fusion = self.fusion_layer2(x)  # [b, 2048]
-        
-        # 3. Stage-dominant: weighted combination of stage signals, then project [b, 2048]
+
         gated_stage_features = jnp.concatenate([
-            sincos_encoding * gate_sincos,        # [b, 1024]
-            task_stage_embedding * gate_task_stage  # [b, 1024]
+            sincos_encoding * gate_sincos,
+            skill_embedding * gate_task_stage,
         ], axis=-1)  # [b, 2048]
         stage_dominant = self.stage_projection(gated_stage_features)  # [b, 2048]
-        
-        # 4. Pure stage: concatenate the embeddings (already 2048) [b, 2048]
-        pure_stage = jnp.concatenate([sincos_encoding, task_stage_embedding], axis=-1)
-        
-        # Stack all four representations [b, 4, 2048]
-        fused_embeddings = jnp.stack([task_gated, balanced_fusion, stage_dominant, pure_stage], axis=1)
-        
-        return fused_embeddings
+
+        pure_stage = jnp.concatenate([sincos_encoding, skill_embedding], axis=-1)  # [b, 2048]
+
+        return jnp.stack([task_gated, balanced_fusion, stage_dominant, pure_stage], axis=1)  # [b, 4, 2048]
 
     @at.typecheck
     def embed_prefix(
@@ -559,34 +525,53 @@ class PiBehavior(_model.BaseModel):
             # Image tokens attend to each other
             ar_mask += [False] * image_tokens.shape[1]
 
-        # Add task embeddings with subtask state fusion
+        # Add rich language prompt + task embedding + skill+progress fusion.
+        # tokenized_prompt layout: [task_id, skill_id, lang_tok_0..lang_tok_{L-1}]
+        #   pos 0  → task_embeddings lookup (base_task token)
+        #   pos 1  → skill_embeddings lookup (via SKILL_ID_LUT)
+        #   pos 2+ → PaliGemma text tokens (padded via tokenized_prompt_mask)
+        # Prefix order: [images] [text_tokens (F...)] [task_id_emb (F)] [4 fused (T,F,F,F)] ...
+        # `argmax(prefix_ar_mask)` still finds the first True (== first fused/stage token),
+        # and base_task_token_idx = that_idx - 1 still points at the task_id_emb.
         if obs.tokenized_prompt is not None:
-            # obs.tokenized_prompt now contains task_ids (shape: [batch_size, 2])
-            task_ids = obs.tokenized_prompt[:, 0]  # Extract task_id: [batch_size]
-            base_task_embedding = self.task_embeddings(task_ids)  # shape: [batch_size, embed_dim]
-            
-            # ALWAYS use the input subtask state - never use predicted state inside model
-            if obs.tokenized_prompt.shape[1] > 1:  # If we have [task_id, subtask_state]
-                subtask_state = obs.tokenized_prompt[:, 1]  # Use input subtask state
-            else:
-                raise ValueError("subtask_state must be provided in tokenized_prompt for PI_BEHAVIOR model")
-            
-            # Fuse task embedding with subtask state - returns [b, 4, d] with multiple representations
-            fused_task_embeddings = self.fuse_task_and_subtask(base_task_embedding, task_ids, subtask_state)
-            
-            # Create task token sequence: [base_task, task_gated, balanced_fusion, stage_dominant, pure_stage]
+            batch_size_local = obs.tokenized_prompt.shape[0]
+
+            # -- language tokens (positions 2..) --
+            lang_token_ids = obs.tokenized_prompt[:, 2:]      # [B, L]
+            lang_token_mask = obs.tokenized_prompt_mask[:, 2:]  # [B, L]
+            lang_tokens_emb = self.PaliGemma.llm(lang_token_ids, method="embed")  # [B, L, D]
+            tokens.append(lang_tokens_emb)
+            input_mask.append(lang_token_mask)
+            # bidirectional attention across the whole language span
+            ar_mask += [False] * lang_tokens_emb.shape[1]
+
+            # -- task_id + skill_id lookups --
+            task_ids = obs.tokenized_prompt[:, 0]  # [B]
+            raw_skill_ids = obs.tokenized_prompt[:, 1]  # [B], sparse in [0..102]
+            skill_lut = jnp.array(SKILL_ID_LUT, dtype=jnp.int32)
+            # Guard OOV skill ids (route to slot 0 = unknown). Uses take with clip mode.
+            skill_idx = skill_lut[jnp.clip(raw_skill_ids, 0, len(SKILL_ID_LUT) - 1)]  # [B]
+
+            base_task_embedding = self.task_embeddings(task_ids)  # [B, D]
+
+            # subtask_progress must be supplied via the Observation dataclass.
+            if obs.subtask_progress is None:
+                raise ValueError(
+                    "subtask_progress must be provided in Observation for PI_BEHAVIOR (B1a stages)."
+                )
+            fused_task_embeddings = self.fuse_task_and_subtask(
+                base_task_embedding, skill_idx, obs.subtask_progress
+            )  # [B, 4, D]
+
             task_sequence = jnp.concatenate([
-                base_task_embedding[:, None, :],  # [b, 1, d] - base task token
-                fused_task_embeddings              # [b, 4, d] - stage-conditioned tokens
-            ], axis=1)  # [b, 5, d]
-            
+                base_task_embedding[:, None, :],  # [B, 1, D] base_task token (base_task_token_idx anchor)
+                fused_task_embeddings,             # [B, 4, D] gated fusion tokens
+            ], axis=1)  # [B, 5, D]
+
             tokens.append(task_sequence)
-            # All task tokens are valid
-            task_mask = jnp.ones((obs.tokenized_prompt.shape[0], 5), dtype=jnp.bool_)
-            input_mask.append(task_mask)
-            # Hierarchical attention: base task (False) then stage tokens (True, False, False, False)
-            # Base task attends to images bidirectionally
-            # Stage tokens attend to images+task but not vice versa
+            input_mask.append(jnp.ones((batch_size_local, 5), dtype=jnp.bool_))
+            # base_task=False, then first fused=True (defines "first stage" for argmax anchor),
+            # remaining three fused tokens = False.
             ar_mask += [False] + [True, False, False, False]
             
         # Add state as discrete tokens (Pi05 style)
@@ -712,23 +697,14 @@ class PiBehavior(_model.BaseModel):
             positions=positions_prefix
         )
         
-        # 3. Predict stage from VLM output of base task token
-        # Base task token is the first token after all image tokens
-        # Image tokens all have ar_mask=False, task starts with ar_mask=False (base) then True (stage tokens)
-        # Structure: [images (all False)] [base_task (False)] [stages (True, False, False, False)]
-        # Find first True (first stage token), base task is at that index - 1
-        first_stage_token_idx = jnp.argmax(prefix_ar_mask)  # Returns index of first True
+        # 3. Predict skill from VLM output of the base_task token.
+        # Prefix layout: [images (F...)] [text (F...)] [base_task (F)] [4 fused (T,F,F,F)] ...
+        # argmax(prefix_ar_mask) returns the first True — the first fused/stage token —
+        # so base_task_token_idx = that_idx - 1 points at the task_id_emb (unchanged).
+        first_stage_token_idx = jnp.argmax(prefix_ar_mask)
         base_task_token_idx = first_stage_token_idx - 1
         base_task_output = prefix_out[:, base_task_token_idx, :]
-        subtask_logits = self.stage_pred_from_vlm(base_task_output)  # [B, MAX_NUM_STAGES]
-        
-        # Mask out invalid stages for each task (vectorized JAX operations)
-        task_ids = observation.tokenized_prompt[:, 0]  # [B]
-        task_num_stages_array = jnp.array(TASK_NUM_STAGES, dtype=jnp.int32)
-        task_num_stages = task_num_stages_array[task_ids]  # [B] - JAX array indexing
-        stage_range = jnp.arange(MAX_NUM_STAGES)  # [15]
-        valid_mask = stage_range[None, :] < task_num_stages[:, None]  # [B, 15]
-        subtask_logits = jnp.where(valid_mask, subtask_logits, -jnp.inf)  # Mask invalid stages
+        subtask_logits = self.skill_pred_from_vlm(base_task_output)  # [B, NUM_SKILLS]
         
         # 4. Extract FAST loss from prefix output (before removing from cache)
         fast_loss_value = 0.0
@@ -884,16 +860,19 @@ class PiBehavior(_model.BaseModel):
         # Total action loss: mean over horizon (H) and action dims (D) -> [B]
         losses["action_loss"] = jnp.mean(action_loss, axis=(-2, -1))
 
-        # 12. Add subtask loss during training
+        # 12. Add skill (was subtask) auxiliary loss during training.
+        # Ground truth = SKILL_ID_LUT[raw_skill_id]; predictions live in the NUM_SKILLS space.
         subtask_loss_value = 0.0
-        if train and observation.tokenized_prompt.shape[1] > 1:            
-            ground_truth_subtask = observation.tokenized_prompt[:, 1]
+        if train and observation.tokenized_prompt.shape[1] > 1:
+            raw_gt_skill = observation.tokenized_prompt[:, 1]
+            skill_lut_arr = jnp.array(SKILL_ID_LUT, dtype=jnp.int32)
+            ground_truth_skill = skill_lut_arr[jnp.clip(raw_gt_skill, 0, len(SKILL_ID_LUT) - 1)]
             subtask_loss = -jax.nn.log_softmax(subtask_logits)[
-                jnp.arange(ground_truth_subtask.shape[0]), ground_truth_subtask
+                jnp.arange(ground_truth_skill.shape[0]), ground_truth_skill
             ]
             losses["subtask_loss"] = jnp.mean(subtask_loss)
             losses["subtask_accuracy"] = jnp.mean(
-                jnp.argmax(subtask_logits, axis=-1) == ground_truth_subtask
+                jnp.argmax(subtask_logits, axis=-1) == ground_truth_skill
             )
             subtask_loss_value = self.config.subtask_loss_weight * jnp.mean(subtask_loss)
         
@@ -1006,20 +985,11 @@ class PiBehavior(_model.BaseModel):
         positions = jnp.cumsum(prefix_mask, axis=1) - 1
         (prefix_out, _), kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
         
-        # Predict stage from VLM output of base task token
-        # Find base task token position (same logic as in compute_detailed_loss)
-        first_stage_token_idx = jnp.argmax(prefix_ar_mask)  # Returns index of first True
+        # Predict skill logits (same anchor as in compute_detailed_loss).
+        first_stage_token_idx = jnp.argmax(prefix_ar_mask)
         base_task_token_idx = first_stage_token_idx - 1
         base_task_output = prefix_out[:, base_task_token_idx, :]
-        subtask_logits = self.stage_pred_from_vlm(base_task_output)  # [B, MAX_NUM_STAGES]
-        
-        # Mask out invalid stages for each task (vectorized JAX operations)
-        task_ids = observation.tokenized_prompt[:, 0]  # [B]
-        task_num_stages_array = jnp.array(TASK_NUM_STAGES, dtype=jnp.int32)
-        task_num_stages = task_num_stages_array[task_ids]  # [B] - JAX array indexing
-        stage_range = jnp.arange(MAX_NUM_STAGES)  # [15]
-        valid_mask = stage_range[None, :] < task_num_stages[:, None]  # [B, 15]
-        subtask_logits = jnp.where(valid_mask, subtask_logits, -jnp.inf)
+        subtask_logits = self.skill_pred_from_vlm(base_task_output)  # [B, NUM_SKILLS]
         
         # Transform KV cache for cross-layer attention
         if self.kv_transform is not None:

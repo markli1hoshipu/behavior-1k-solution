@@ -41,7 +41,11 @@ class Observation(Generic[ArrayT]):
     tokenized_prompt_mask: at.Bool[ArrayT, "*b l"] | None = None
     token_ar_mask: at.Int[ArrayT, "*b l"] | None = None
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
-    
+
+    # Continuous progress signal in [0, 1] = current_frame / episode_length.
+    # Sin/cos-encoded inside the model and fused with skill_embeddings + task_embedding.
+    subtask_progress: at.Float[ArrayT, "*b"] | None = None
+
     fast_tokens: at.Int[ArrayT, "*b t"] | None = None
     fast_token_mask: at.Bool[ArrayT, "*b t"] | None = None
 
@@ -66,6 +70,7 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            subtask_progress=data.get("subtask_progress"),
             fast_tokens=data.get("fast_tokens"),
             fast_token_mask=data.get("fast_token_mask"),
         )
@@ -137,6 +142,7 @@ def preprocess_observation(
         tokenized_prompt_mask=observation.tokenized_prompt_mask,
         token_ar_mask=observation.token_ar_mask,
         token_loss_mask=observation.token_loss_mask,
+        subtask_progress=getattr(observation, 'subtask_progress', None),
         fast_tokens=getattr(observation, 'fast_tokens', None),
         fast_token_mask=getattr(observation, 'fast_token_mask', None),
     )

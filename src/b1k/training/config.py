@@ -102,14 +102,37 @@ class GroupFactory(Protocol):
 class ModelTransformFactory(GroupFactory):
     """Creates model transforms for B1K."""
 
-    default_prompt: str | None = None  # Not used (task embeddings instead)
+    default_prompt: str | None = None  # not used; language comes from tasks.jsonl now
+    # B1a annotation directory (annotations/task-XXXX/episode_YYYYYYYY.json).
+    # Empty string → annotate transform emits skill_id=0, subtask_progress=0.0.
+    annotations_dir: str = ""
+    # Rich-prompt source (meta/tasks.jsonl from behavior-1k/2026-challenge-demos).
+    task_prompts_path: str = ""
+    # Must match PiBehaviorConfig.max_lang_tokens.
+    max_lang_tokens: int = 128
+    episodes_per_task: int = 200
+    # Fraction of samples whose skill name is replaced by "unknown" in the prompt.
+    # Keeps skill_pred_from_vlm learnable — see TaskIndexToPromptTokens.
+    skill_prompt_dropout: float = 0.5
+    skill_dropout_seed: int = 0
 
     def __call__(self, model_config: _model.BaseModelConfig) -> _transforms.Group:
+        # Prefer the config-supplied path if present (keeps this factory reusable across configs).
+        prompts_path = self.task_prompts_path or getattr(model_config, "task_prompts_path", "")
+        lang_len = self.max_lang_tokens or getattr(model_config, "max_lang_tokens", 128)
         return _transforms.Group(
             inputs=[
                 _transforms.ResizeImages(224, 224),
-                b1k_transforms.ComputeSubtaskStateFromMeta(dataset=None),
-                b1k_transforms.TaskIndexToTaskId(),
+                b1k_transforms.AnnotateSkillFromAnnotation(
+                    annotations_dir=self.annotations_dir,
+                    episodes_per_task=self.episodes_per_task,
+                ),
+                b1k_transforms.TaskIndexToPromptTokens(
+                    task_prompts_path=prompts_path,
+                    max_lang_tokens=lang_len,
+                    skill_prompt_dropout=self.skill_prompt_dropout,
+                    skill_dropout_seed=self.skill_dropout_seed,
+                ),
                 _transforms.PadStatesAndActions(model_config.action_dim),
             ],
         )
@@ -158,9 +181,16 @@ class LeRobotB1KDataConfig(DataConfigFactory):
 
     action_sequence_keys: Sequence[str] = ("action",)
     use_delta_joint_actions: bool = False
-    
+
     # FAST auxiliary tokenization (only for PI_BEHAVIOR with use_fast_auxiliary)
     use_fast_tokenization: bool = False
+
+    # B1a / Path B language wiring — passed through to ModelTransformFactory.
+    annotations_dir: str = ""
+    task_prompts_path: str = ""
+    episodes_per_task: int = 200
+    skill_prompt_dropout: float = 0.5
+    skill_dropout_seed: int = 0
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -198,8 +228,15 @@ class LeRobotB1KDataConfig(DataConfigFactory):
             outputs=[_transforms.AbsoluteActions(delta_action_mask)],
         )
 
-        # Model transforms (subtask state, task ID, padding)
-        model_transforms = ModelTransformFactory()(model_config)
+        # Model transforms (skill+progress annotation, prompt tokenization, padding)
+        model_transforms = ModelTransformFactory(
+            annotations_dir=self.annotations_dir,
+            task_prompts_path=self.task_prompts_path,
+            max_lang_tokens=getattr(model_config, "max_lang_tokens", 128),
+            episodes_per_task=self.episodes_per_task,
+            skill_prompt_dropout=self.skill_prompt_dropout,
+            skill_dropout_seed=self.skill_dropout_seed,
+        )(model_config)
         
         # FAST tokenization (if enabled for PI_BEHAVIOR)
         if self.use_fast_tokenization and hasattr(model_config, 'use_fast_auxiliary') and model_config.use_fast_auxiliary:
@@ -375,6 +412,140 @@ _CONFIGS = [
         num_workers=80,
         save_interval=500,
         keep_period=2000,
+    ),
+    # SMOKE: 500-step run on 5 diverse tasks (mix of 2025 and 2026 halves).
+    # Goal: catch bugs in the new prompt/skill pipeline before committing to full-scale.
+    # Uses Ilia's 50t norm_stats + FAST tokenizer symlinked into ./outputs/assets.
+    TrainConfig(
+        name="pi_behavior_b1k_100_smoke",
+        exp_name="smoke",
+        project_name="B1K",
+        model=pi_behavior_config.PiBehaviorConfig(
+            action_horizon=30,
+            action_dim=32,
+            num_tasks=100,
+            max_lang_tokens=128,
+            use_correlated_noise=True,
+            correlation_beta=0.5,
+            use_fast_auxiliary=True,
+            fast_loss_weight=0.05,
+            fast_encoded_dims="0:6,7:23",
+            fast_vocab_size=1024,
+            max_fast_tokens=200,
+            use_kv_transform=True,
+            use_knowledge_insulation=False,
+            subtask_loss_weight=0.1,
+            freeze_vision_backbone=True,
+        ),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2026-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=False,
+                behavior_dataset_root="/work/markhsp/datasets/lerobot/b1k_2026_all_tasks",
+                use_per_timestamp_norm=True,
+                # 5 diverse tasks (0, 50, 51, 60, 80) = 1000 episodes. The monkeypatch
+                # in create_behavior_dataset remaps global episode_index → compact tensor
+                # position, so non-contiguous filters like this now work.
+                episodes_index=(
+                    list(range(0, 200))            # task 0
+                    + list(range(10000, 10200))    # task 50
+                    + list(range(10200, 10400))    # task 51
+                    + list(range(12000, 12200))    # task 60
+                    + list(range(16000, 16200))    # task 80
+                ),
+            ),
+            use_delta_joint_actions=True,
+            use_fast_tokenization=True,
+            annotations_dir="/work/markhsp/datasets/behavior-1k-2026-challenge-demos/annotations",
+            task_prompts_path="/work/markhsp/datasets/behavior-1k-2026-challenge-demos/meta/tasks.jsonl",
+            episodes_per_task=200,
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=50,
+            peak_lr=1e-4,
+            decay_steps=100,
+            decay_lr=1e-5,
+        ),
+        num_flow_samples=15,
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            "/work/markhsp/models/behavior_50t_checkpoint/params"
+        ),
+        num_train_steps=100,       # smoke: catch bugs + verify loss decreases
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=16,            # multiproc dataloading — subclass survives pickle
+        batch_size=2048,           # Ilia's README: 8×H200 FSDP → 256/GPU
+        save_interval=50,
+        keep_period=100,
+        fsdp_devices=8,
+        wandb_enabled=False,
+    ),
+    # 100-task 2026 config: Path B (rich language) + B1a (annotation-based skill stages).
+    # Warm-starts from Ilia's 50-task pi_behavior checkpoint (task_embeddings 50→100 rows
+    # padded with random init; skill_embeddings & skill_pred_from_vlm are fresh random).
+    TrainConfig(
+        name="pi_behavior_b1k_100",
+        exp_name="openpi",
+        project_name="B1K",
+        model=pi_behavior_config.PiBehaviorConfig(
+            action_horizon=30,
+            action_dim=32,
+            num_tasks=100,
+            max_lang_tokens=128,
+            use_correlated_noise=True,
+            correlation_beta=0.5,
+            use_fast_auxiliary=True,
+            fast_loss_weight=0.05,
+            fast_encoded_dims="0:6,7:23",
+            fast_vocab_size=1024,
+            max_fast_tokens=200,
+            use_kv_transform=True,
+            use_knowledge_insulation=False,
+            subtask_loss_weight=0.1,
+            freeze_vision_backbone=True,
+        ),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2026-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=False,
+                behavior_dataset_root="/work/markhsp/datasets/lerobot/b1k_2026_all_tasks",
+                use_per_timestamp_norm=True,
+                # No episode filter → full 40M-frame training set (all 100 tasks × 200 eps).
+                episodes_index=None,
+            ),
+            use_delta_joint_actions=True,
+            use_fast_tokenization=True,
+            annotations_dir="/work/markhsp/datasets/behavior-1k-2026-challenge-demos/annotations",
+            task_prompts_path="/work/markhsp/datasets/behavior-1k-2026-challenge-demos/meta/tasks.jsonl",
+            episodes_per_task=200,
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-4,
+            decay_steps=20_000,
+            decay_lr=1e-5,
+        ),
+        num_flow_samples=15,
+        # Warm-start from Ilia's 50-task intermediate; loader expands task_embeddings
+        # [50, 2048] → [100, 2048] (top 50 from ckpt, bottom 50 random), drops the old
+        # per-task-stage tables (replaced by B1a global skill_embeddings).
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            "/work/markhsp/models/behavior_50t_checkpoint/params"
+        ),
+        num_train_steps=200_000,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        # NOTE: Ilia's num_workers=80 was tuned for their BehaviorLeRobotDataset with
+        # chunk_streaming_using_keyframe. Standard LeRobotDataset + HF datasets doesn't
+        # handle that — workers race on the arrow cache and RSS explodes to 200+GB with
+        # no forward progress. num_workers=0 confirmed to reach the first train step;
+        # bump back up to 4-8 only after validating the pipeline.
+        num_workers=0,
+        batch_size=2048,           # Ilia's README: 8×H200 FSDP → 256/GPU
+        fsdp_devices=8,
+        save_interval=500,
+        keep_period=2000,
+        wandb_enabled=False,       # flip to True after `wandb login`
     ),
 ]
 

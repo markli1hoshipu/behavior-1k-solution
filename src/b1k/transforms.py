@@ -34,156 +34,303 @@ from openpi.transforms import (
     make_bool_mask,
 )
 
-from b1k.models.pi_behavior_config import TASK_NUM_STAGES
+import glob
+import hashlib
+import json
+import os
+import pathlib
+
 from b1k.shared.normalize import NormStats
+from openpi.models.tokenizer import PaligemmaTokenizer
+
+
+_ANN_INDEX_CACHE: dict[str, dict[int, dict]] = {}
+_TOKENIZER_CACHE: dict[int, PaligemmaTokenizer] = {}
+_TASK_PROMPTS_CACHE: dict[str, dict[int, str]] = {}
+
+
+def _load_annotations_index(annotations_dir: str, episodes_per_task: int = 200) -> dict[int, dict]:
+    """Build LeRobot episode_index -> annotation dict, memoized per annotations_dir.
+
+    Assumes the 2026 layout: annotations_dir/task-XXXX/episode_YYYYYYYY.json, where the
+    LeRobot episode_index of the i-th (sorted) annotation file under task-T is
+    T*episodes_per_task + i. Loads all files eagerly (~50 MB for 100*200 files).
+    """
+    if annotations_dir in _ANN_INDEX_CACHE:
+        return _ANN_INDEX_CACHE[annotations_dir]
+
+    root = pathlib.Path(annotations_dir).expanduser()
+    idx: dict[int, dict] = {}
+    task_dirs = sorted(root.glob("task-*"))
+    if not task_dirs:
+        raise FileNotFoundError(f"No task-XXXX directories found under {annotations_dir}")
+    for td in task_dirs:
+        try:
+            task_id = int(td.name.split("-")[1])
+        except (IndexError, ValueError):
+            continue
+        ann_files = sorted(td.glob("episode_*.json"))
+        for i, af in enumerate(ann_files):
+            ep_idx = task_id * episodes_per_task + i
+            with open(af) as fh:
+                ann = json.load(fh)
+            idx[ep_idx] = {
+                "task_duration": int(ann.get("meta_data", {}).get("task_duration", 0)),
+                "skill_annotation": ann.get("skill_annotation", []),
+            }
+    logging.info(f"Loaded {len(idx)} episode annotations from {annotations_dir}")
+    _ANN_INDEX_CACHE[annotations_dir] = idx
+    return idx
+
+
+def _load_task_prompts(path: str) -> dict[int, str]:
+    """Load meta/tasks.jsonl (task_index -> rich prompt string)."""
+    if path in _TASK_PROMPTS_CACHE:
+        return _TASK_PROMPTS_CACHE[path]
+    result: dict[int, str] = {}
+    with open(pathlib.Path(path).expanduser()) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            result[int(row["task_index"])] = row["task"]
+    _TASK_PROMPTS_CACHE[path] = result
+    logging.info(f"Loaded {len(result)} rich task prompts from {path}")
+    return result
+
+
+def _get_tokenizer(max_len: int) -> PaligemmaTokenizer:
+    if max_len not in _TOKENIZER_CACHE:
+        _TOKENIZER_CACHE[max_len] = PaligemmaTokenizer(max_len=max_len)
+    return _TOKENIZER_CACHE[max_len]
+
+
+# Sentinel used when the skill is unknown or deliberately dropped from the prompt.
+UNKNOWN_SKILL_NAME = "unknown"
+
+
+def compose_prompt(task_description: str, skill_name: str) -> str:
+    """Canonical rich prompt: full task description + the current skill in words.
+
+    Kept module-level (rather than inlined in the transform) so the eval path can build
+    the exact same string from its *predicted* skill — training and inference must agree
+    on the wording or the model sees a different distribution at eval time.
+
+    The scaffold is emitted even when the skill is unknown, so token positions stay
+    comparable between the informed and dropped cases.
+    """
+    return f"{task_description} Current skill: {skill_name or UNKNOWN_SKILL_NAME}"
+
+
+def _skill_dropout_draw(episode_index: int, current_frame: int, seed: int) -> float:
+    """Deterministic pseudo-random draw in [0, 1) keyed on (episode, frame, seed).
+
+    Deliberately not an RNG object: these transforms run inside torch DataLoader
+    workers, where numpy's *global* seed is not differentiated per worker, so
+    `np.random.*` would produce the same dropout pattern in every worker. Hashing the
+    sample identity instead is worker-safe and makes a run exactly reproducible.
+
+    Trade-off: a given (episode, frame) always lands on the same side of the threshold,
+    so the model never sees that exact frame both with and without its skill. With
+    ~211M frames in the 2026 set there is ample coverage of both regimes; vary `seed`
+    to reshuffle the split.
+    """
+    h = hashlib.blake2b(
+        f"{int(episode_index)}:{int(current_frame)}:{int(seed)}".encode(),
+        digest_size=8,
+    ).digest()
+    return int.from_bytes(h, "big") / float(1 << 64)
 
 
 @dataclasses.dataclass(frozen=True)
-class TaskIndexToTaskId(DataTransformFn):
-    """Directly converts task_index to task_id for PI_BEHAVIOR model.
-    
-    PI_BEHAVIOR uses task embeddings instead of text prompts. This transform
-    converts the dataset's task_index to task_id and prepares tokenized_prompt
-    as [task_id, subtask_state] for the model.
-    
-    Assumes:
-    - data["task_index"] exists (from dataset)
-    - data["subtask_state"] exists (computed by ComputeSubtaskStateFromMeta)
-    
-    Creates:
-    - data["tokenized_prompt"]: np.array([task_id, subtask_state], dtype=int32)
-    - data["tokenized_prompt_mask"]: np.array([True, True], dtype=bool)
+class AnnotateSkillFromAnnotation(DataTransformFn):
+    """B1a: emit skill_id + subtask_progress from per-episode BEHAVIOR-1K skill annotation.
+
+    Reads annotations/task-XXXX/episode_YYYYYYYY.json (one per LeRobot episode) and:
+    - locates the skill segment whose frame_duration=[start, end) contains the current
+      frame, and emits its `skill_id[0]` as data["skill_id"]
+    - emits data["subtask_progress"] = current_frame / episode_length in [0, 1]
+
+    Both fields are consumed by TaskIndexToPromptTokens (skill_id → tokenized_prompt[1])
+    and by the model (subtask_progress → Observation.subtask_progress).
     """
-    
-    # Optional task remapping (dataset task_index → model task_id)
-    # If None, assumes direct mapping (task_index == task_id)
-    task_mapping: dict[int, int] | None = None
-    
+
+    annotations_dir: str = ""
+    # Fallback episodes-per-task for the assumed LeRobot indexing scheme.
+    episodes_per_task: int = 200
+    # Fallback skill_id when the current frame doesn't fall in any segment (padded/edge).
+    fallback_skill_id: int = 0
+
     def __call__(self, data: DataDict) -> DataDict:
-        # During inference, task_id might be provided directly instead of task_index
+        # Inference mode / missing metadata → emit defaults so the model doesn't crash.
+        if not self.annotations_dir or "episode_index" not in data or "timestamp" not in data:
+            data.setdefault("skill_id", np.array(self.fallback_skill_id, dtype=np.int32))
+            data.setdefault("skill_name", "")
+            data.setdefault("subtask_progress", np.array(0.0, dtype=np.float32))
+            return data
+
+        try:
+            ann_idx = _load_annotations_index(self.annotations_dir, self.episodes_per_task)
+        except FileNotFoundError as e:
+            logging.warning(f"AnnotateSkillFromAnnotation: {e}. Emitting defaults.")
+            data["skill_id"] = np.array(self.fallback_skill_id, dtype=np.int32)
+            data["skill_name"] = ""
+            data["subtask_progress"] = np.array(0.0, dtype=np.float32)
+            return data
+
+        ep_idx = int(data["episode_index"])
+        rec = ann_idx.get(ep_idx)
+        if rec is None:
+            data["skill_id"] = np.array(self.fallback_skill_id, dtype=np.int32)
+            data["skill_name"] = ""
+            data["subtask_progress"] = np.array(0.0, dtype=np.float32)
+            return data
+
+        current_frame = float(data["timestamp"]) * 30.0  # 30 FPS
+        ep_len = max(1, int(rec["task_duration"]))
+        progress = float(np.clip(current_frame / ep_len, 0.0, 1.0))
+
+        # Linear scan segments; typical episode has <100 segments so this is cheap.
+        # frame_duration comes in two shapes:
+        #   flat:  [start, end]              (~99.8% of segments)
+        #   nested: [[s1, e1], [s2, e2], …]  (~0.2%, single skill spanning discontinuous ranges)
+        skill_id = self.fallback_skill_id
+        skill_name = ""
+        for seg in rec["skill_annotation"]:
+            fd = seg.get("frame_duration", [])
+            if not fd:
+                continue
+            # Normalize to list of [start, end] pairs
+            if isinstance(fd[0], (list, tuple)):
+                ranges = fd
+            elif len(fd) >= 2 and isinstance(fd[0], (int, float)):
+                ranges = [fd]
+            else:
+                continue
+            matched = False
+            for r in ranges:
+                if len(r) < 2:
+                    continue
+                start, end = r[0], r[1]
+                if start <= current_frame < end:
+                    ids = seg.get("skill_id", [])
+                    if ids:
+                        skill_id = int(ids[0])
+                    # Human-readable name for the same segment ("move to", "place on",
+                    # ...), used to render the skill into the language prompt.
+                    descs = seg.get("skill_description", [])
+                    if descs:
+                        skill_name = str(descs[0])
+                    matched = True
+                    break
+            if matched:
+                break
+
+        data["skill_id"] = np.array(skill_id, dtype=np.int32)
+        data["skill_name"] = skill_name
+        data["subtask_progress"] = np.array(progress, dtype=np.float32)
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
+class TaskIndexToPromptTokens(DataTransformFn):
+    """Assemble tokenized_prompt = [task_id, skill_id, lang_tok_0, ..., lang_tok_{L-1}].
+
+    - task_id from data["task_id"] (inference) or data["task_index"] (training)
+    - skill_id from data["skill_id"] (populated by AnnotateSkillFromAnnotation)
+    - lang tokens from PaligemmaTokenizer(compose_prompt(task_description, skill_name))
+
+    Also forwards subtask_progress as a float scalar so the Observation dataclass picks
+    it up as a top-level field (via RepackTransform).
+
+    Skill-in-prompt dropout
+    -----------------------
+    The skill name is rendered into the text, but on a `skill_prompt_dropout` fraction of
+    samples it is replaced by "unknown". This is not regularization for its own sake — it
+    protects `skill_pred_from_vlm`. That head reads the base_task token, which sits in the
+    same bidirectional attention block as the text tokens (unlike skill_embeddings, which
+    lives behind the first ar_mask=True fused token and therefore cannot leak). So with
+    the skill spelled out in the text, predicting it is trivial and the auxiliary loss
+    collapses — yet at eval that head is exactly what supplies the skill, since no
+    ground-truth annotation exists there. Dropped samples keep it honest.
+
+    Note this drops the skill from the *text* only; tokenized_prompt[1] still carries the
+    ground-truth skill_id, which is both the skill_embeddings input and the auxiliary
+    target. Teacher forcing therefore remains on the embedding path; if eval shows errors
+    compounding, dropping that too requires separating input from target in the model.
+    """
+
+    # Path to meta/tasks.jsonl (rows: {task_index, task_name, task}).
+    task_prompts_path: str = ""
+    # Optional dataset task_index -> model task_id remap. If None, identity.
+    task_mapping: dict[int, int] | None = None
+    # Max PaliGemma text tokens (must match PiBehaviorConfig.max_lang_tokens).
+    max_lang_tokens: int = 128
+    # Fraction of samples whose skill name is replaced by "unknown" in the prompt.
+    # 0.0 disables (always informed); 1.0 never shows the skill in text.
+    skill_prompt_dropout: float = 0.5
+    # Salt for the deterministic dropout draw — change it to reshuffle which samples
+    # are dropped without changing anything else.
+    skill_dropout_seed: int = 0
+
+    def __call__(self, data: DataDict) -> DataDict:
+        # Task id
         if "task_id" in data:
-            # Direct task_id provided (inference mode)
             task_id = int(data["task_id"])
         elif "task_index" in data:
-            # task_index provided (training mode)
             task_index = int(data["task_index"])
-            
-            # Apply mapping if provided, otherwise use task_index directly as task_id
-            if self.task_mapping is not None:
-                if task_index not in self.task_mapping:
-                    raise ValueError(f"task_index {task_index} not found in mapping")
-                task_id = self.task_mapping[task_index]
-            else:
-                task_id = task_index
+            task_id = self.task_mapping[task_index] if self.task_mapping else task_index
+        elif "tokenized_prompt" in data:
+            return data
         else:
-            # During inference, if neither is provided, this transform should be skipped
-            # The tokenized_prompt should already be set up correctly
-            if "tokenized_prompt" in data:
-                return data  # Already has tokenized_prompt, skip this transform
-            raise ValueError("Either task_index, task_id, or tokenized_prompt is required for PI_BEHAVIOR model")
+            raise ValueError("Need task_index, task_id, or existing tokenized_prompt.")
 
-        # Pack task_id and subtask_state (if available) into tokenized_prompt
-        if "subtask_state" in data:
-            subtask_state = int(data["subtask_state"])
-            prompt_tokens = np.array([task_id, subtask_state], dtype=np.int32)  # [task_id, subtask_state]
-            prompt_mask = np.array([True, True], dtype=bool)
+        skill_id = int(data.get("skill_id", 0))
+        subtask_progress = float(data.get("subtask_progress", 0.0))
+
+        # Rich language prompt lookup (falls back to a minimal string).
+        if self.task_prompts_path:
+            prompts = _load_task_prompts(self.task_prompts_path)
         else:
-            prompt_tokens = np.array([task_id], dtype=np.int32)  # Just [task_id]
-            prompt_mask = np.array([True], dtype=bool)
+            prompts = {}
+        task_description = prompts.get(task_id, f"task {task_id}")
+
+        # Render the current skill into the text, dropping it on a deterministic subset.
+        skill_name = str(data.get("skill_name", "") or "")
+        if skill_name and self.skill_prompt_dropout > 0.0:
+            draw = _skill_dropout_draw(
+                episode_index=int(data.get("episode_index", 0)),
+                current_frame=int(float(data.get("timestamp", 0.0)) * 30.0),
+                seed=self.skill_dropout_seed,
+            )
+            if draw < self.skill_prompt_dropout:
+                skill_name = ""
+        prompt = compose_prompt(task_description, skill_name)
+
+        tok = _get_tokenizer(self.max_lang_tokens)
+        lang_tokens, lang_mask = tok.tokenize(prompt, state=None)  # [max_lang], [max_lang]
+
+        prompt_tokens = np.concatenate([
+            np.array([task_id, skill_id], dtype=np.int32),
+            lang_tokens.astype(np.int32),
+        ], axis=0)
+        prompt_mask = np.concatenate([
+            np.array([True, True], dtype=bool),
+            lang_mask.astype(bool),
+        ], axis=0)
 
         return {
-            **data, 
+            **data,
             "tokenized_prompt": prompt_tokens,
-            "tokenized_prompt_mask": prompt_mask
+            "tokenized_prompt_mask": prompt_mask,
+            "subtask_progress": np.asarray(subtask_progress, dtype=np.float32),
         }
 
 
-@dataclasses.dataclass(frozen=True)
-class ComputeSubtaskStateFromMeta(DataTransformFn):
-    """Computes subtask state from timestamp using dataset.meta.episodes.
-    
-    Divides episode into task-specific number of stages based on episode length.
-    Requires dataset reference to access episode metadata.
-    
-    Args:
-        dataset: Dataset instance with meta.episodes containing episode_length
-    
-    Assumes:
-    - data["episode_index"] exists
-    - data["timestamp"] exists (frame index within episode)
-    - data["task_index"] exists (for task-specific stage count)
-    - dataset.meta.episodes contains episode_length for each episode
-    
-    Creates:
-    - data["subtask_state"]: Stage index (0 to num_stages-1)
-    """
-    
-    dataset: object | None = None  # Will be set by data loader
-    
-    def __call__(self, data: DataDict) -> DataDict:
-        if self.dataset is None:
-            # During inference or when dataset is not available, use default
-            data["subtask_state"] = np.array(0, dtype=np.int32)
-            return data
-        
-        if "episode_index" not in data or "timestamp" not in data or "task_index" not in data:
-            # Missing required fields, default to stage 0
-            data["subtask_state"] = np.array(0, dtype=np.int32)
-            return data
-        
-        episode_index = int(data["episode_index"])
-        timestamp = float(data["timestamp"])
-        task_index = int(data["task_index"])
-        
-        # Validate task_index
-        if not (0 <= task_index < 50):
-            logging.warning(f"Invalid task_index {task_index}, using stage 0")
-            data["subtask_state"] = np.array(0, dtype=np.int32)
-            return data
-        
-        # Get number of stages for this task
-        num_stages = TASK_NUM_STAGES[task_index]
-        
-        # Get episode length from dataset metadata
-        if not hasattr(self.dataset, 'meta') or not hasattr(self.dataset.meta, 'episodes'):
-            # No metadata available
-            data["subtask_state"] = np.array(0, dtype=np.int32)
-            return data
-            
-        meta_episodes = self.dataset.meta.episodes
-        
-        if episode_index not in meta_episodes:
-            logging.warning(f"Episode {episode_index} not found in metadata, using stage 0")
-            data["subtask_state"] = np.array(0, dtype=np.int32)
-            return data
-            
-        episode_info = meta_episodes[episode_index]
-        
-        # Try 'length' first (standard key), then 'episode_length' (alternative)
-        episode_length = episode_info.get('length', episode_info.get('episode_length', None))
-        
-        if episode_length is None or episode_length <= 0:
-            logging.warning(f"Invalid episode_length for episode {episode_index}, using stage 0")
-            data["subtask_state"] = np.array(0, dtype=np.int32)
-            return data
-        
-        episode_length = float(episode_length)
-        
-        # CRITICAL: Convert timestamp (in seconds) to frames (30 FPS)
-        # Dataset provides timestamp in seconds, episode_length is in frames
-        current_step = timestamp * 30.0
-        
-        # Divide episode into num_stages equal parts
-        frames_per_stage = episode_length / num_stages
-        
-        # Compute current stage (0-indexed)
-        subtask_state = int(current_step / frames_per_stage)
-        
-        # Clamp to valid range [0, num_stages-1]
-        subtask_state = max(0, min(subtask_state, num_stages - 1))
-        
-        data["subtask_state"] = np.array(subtask_state, dtype=np.int32)
-        return data
+# Backwards-compat shims for older callers:
+TaskIndexToTaskId = TaskIndexToPromptTokens
+ComputeSubtaskStateFromMeta = AnnotateSkillFromAnnotation
 
 
 @dataclasses.dataclass(frozen=True)

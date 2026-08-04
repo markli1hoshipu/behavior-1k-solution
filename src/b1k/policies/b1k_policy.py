@@ -12,7 +12,12 @@ import numpy as np
 
 from openpi import transforms
 from openpi.models import model as _model
-from omnigibson.learning.utils.eval_utils import PROPRIOCEPTION_INDICES
+try:
+    # Prefer the real omnigibson definition when the sim is installed (eval env)
+    from omnigibson.learning.utils.eval_utils import PROPRIOCEPTION_INDICES  # type: ignore
+except ImportError:
+    # Training-only environment: use vendored copy.
+    from b1k.shared.proprio_constants import PROPRIOCEPTION_INDICES
 
 
 def make_b1k_example() -> dict:
@@ -74,8 +79,14 @@ class B1kInputs(transforms.DataTransformFn):
     def __call__(self, data: dict) -> dict:
 
         proprio_data = data["observation/state"]
-        # extract joint position
-        state = extract_state_from_proprio(proprio_data)
+        # The 2026 LeRobot dataset already stores observation.state as the 23-D
+        # extracted vector (base_qvel[3]+trunk[4]+arm_l[7]+grip_l[1]+arm_r[7]+grip_r[1]),
+        # not the full 256-D R1Pro raw proprio. extract_state_from_proprio was written
+        # for the raw form and would slice out of bounds here. Detect and pass-through.
+        if hasattr(proprio_data, "shape") and proprio_data.shape[-1] == 23:
+            state = np.asarray(proprio_data)
+        else:
+            state = extract_state_from_proprio(proprio_data)
         if "actions" in data:
             action =  data["actions"]
 

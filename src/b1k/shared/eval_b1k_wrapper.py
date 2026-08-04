@@ -9,7 +9,15 @@ from collections import deque
 from openpi_client.base_policy import BasePolicy
 from openpi_client.image_tools import resize_with_pad
 from b1k.policies.b1k_policy import extract_state_from_proprio
-from b1k.models.pi_behavior_config import TASK_NUM_STAGES
+# B1a: TASK_NUM_STAGES was retired when we switched from time-slicing stages to
+# annotation-based skill_ids. This wrapper's stage-clamping/logging logic still needs
+# a per-task max-stage value; until we rewrite it for skill_ids, fall back to a
+# generous cap. Real stage-count comes from the annotation JSON at eval time.
+_LEGACY_MAX_STAGE_FALLBACK = 15
+class _LegacyStageArray:
+    def __getitem__(self, task_id: int) -> int:
+        return _LEGACY_MAX_STAGE_FALLBACK
+TASK_NUM_STAGES = _LegacyStageArray()  # duck-typed: TASK_NUM_STAGES[task_id] → 15
 from b1k.shared.correction_rules import apply_correction_rules, check_gripper_variation
 from omnigibson.learning.utils.eval_utils import PROPRIOCEPTION_INDICES
 
