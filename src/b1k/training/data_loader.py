@@ -6,6 +6,8 @@ Reference: https://github.com/wensi-ai/openpi/tree/behavior
 import logging
 import time
 
+import torch
+
 # Import all base data loading from OpenPI
 from openpi.training.data_loader import (
     Dataset,
@@ -35,23 +37,40 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset as _LeRobotDataset
 
 
 class B1kLeRobotDataset(_LeRobotDataset):
-    """LeRobotDataset subclass fixing the episode-filter off-by-index bug in v3.
+    """LeRobotDataset with a row-first _query_hf_dataset.
 
-    When `episodes=` is supplied, LeRobot rebuilds `episode_data_index` compactly
-    (size = len(episodes)) but `__getitem__` still reads `episode_index` from the
-    parquet with its ORIGINAL global value, so the lookup crashes for filters that
-    aren't `range(0, N)`. This subclass remaps global → compact position first.
+    Upstream 0.4.4 does:
 
-    Using a subclass (rather than a monkeypatch) means the fix travels with the
-    instance through pickle → DataLoader workers pick it up automatically.
+        result[key] = torch.stack(self.hf_dataset[key][relative_indices])
+
+    described in its docstring as "column-first [key][indices] for speed". On a
+    `datasets.Dataset` carrying a formatting transform that is backwards and
+    catastrophic: indexing by column name materialises the *entire* column through
+    hf_transform_to_torch before 30 of its values are selected. Profiled on the 4-task
+    smoke subset (4.79M rows), one __getitem__ took 187 s, of which 176 s was
+    format_column and 71 s was 4,791,222 torch.tensor calls — one per row in the
+    dataset, per sample. Video decoding was 3.1 s of that 187 s, so this, not the codec
+    or the GOP, is what made the earlier attempt run for 26 h without completing a step.
+
+    Row-first touches only the ~30 requested rows. Upstream's own except-branch already
+    does this, but the column-first path never raises, it just crawls.
+
+    Overriding a private method is deliberate: the alternative is dropping the
+    formatting transform, which the rest of LeRobot relies on.
     """
 
-    def _get_query_indices(self, idx, ep_idx):
-        if getattr(self, "episodes", None) is not None:
-            if not hasattr(self, "_b1k_ep_idx_map"):
-                self._b1k_ep_idx_map = {int(ep): i for i, ep in enumerate(self.episodes)}
-            ep_idx = self._b1k_ep_idx_map.get(int(ep_idx), int(ep_idx))
-        return super()._get_query_indices(idx, ep_idx)
+    def _query_hf_dataset(self, query_indices: dict[str, list[int]]) -> dict:
+        result: dict = {}
+        for key, q_idx in query_indices.items():
+            if key in self.meta.video_keys:
+                continue
+            relative_indices = (
+                q_idx
+                if self._absolute_to_relative_idx is None
+                else [self._absolute_to_relative_idx[idx] for idx in q_idx]
+            )
+            result[key] = torch.stack(self.hf_dataset[relative_indices][key])
+        return result
 
 
 class DataLoaderImpl(DataLoader):
@@ -198,39 +217,6 @@ def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip
     transforms_list.extend(data_config.model_transforms.inputs)
 
     return TransformedDataset(dataset, transforms_list)
-
-
-def extract_episode_lengths_from_dataset(dataset) -> dict[int, float]:
-    """Extract episode lengths from B1K dataset metadata.
-    
-    Args:
-        dataset: BehaviorLeRobotDataset instance
-        
-    Returns:
-        Dictionary mapping episode_index to episode_length (in frames)
-        
-    Raises:
-        ValueError: If dataset doesn't have required metadata
-    """
-    if not hasattr(dataset, 'episode_data_index'):
-        raise ValueError("Dataset must have episode_data_index attribute")
-    
-    episode_data_index = dataset.episode_data_index
-    if 'to' not in episode_data_index or 'from' not in episode_data_index:
-        raise ValueError("episode_data_index must have 'to' and 'from' keys")
-    
-    episode_to = episode_data_index['to'] 
-    episode_from = episode_data_index['from']
-    episodes = dataset.episodes
-    
-    episode_lengths = {}
-    for i, episode_index in enumerate(episodes):
-        if i < len(episode_to) and i < len(episode_from):
-            episode_length = episode_to[i] - episode_from[i]
-            episode_lengths[episode_index] = float(episode_length)
-    
-    logging.info(f"Extracted {len(episode_lengths)} episode lengths from dataset")
-    return episode_lengths
 
 
 def create_behavior_data_loader(
