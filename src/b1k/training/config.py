@@ -195,10 +195,14 @@ class LeRobotB1KDataConfig(DataConfigFactory):
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         # Repack transforms for B1K observations
+        # Camera keys are the official v3.0 names. The old
+        # observation.images.rgb.{head,left_wrist,right_wrist} keys came from our own
+        # v2.1 conversion and raise KeyError here. Roles per ROBOT_CAMERA_NAMES["R1Pro"]
+        # in omnigibson: zed_link = head, left/right_realsense_link = wrists.
         repack_mapping = {
-            "observation/egocentric_camera": "observation.images.rgb.head",
-            "observation/wrist_image_left": "observation.images.rgb.left_wrist",
-            "observation/wrist_image_right": "observation.images.rgb.right_wrist",
+            "observation/egocentric_camera": "observation.rgb.zed_link_camera_0",
+            "observation/wrist_image_left": "observation.rgb.left_realsense_link_camera_0",
+            "observation/wrist_image_right": "observation.rgb.right_realsense_link_camera_0",
             "observation/state": "observation.state",
             "actions": "action",
             "task_index": "task_index",  # Always preserve task_index
@@ -413,6 +417,182 @@ _CONFIGS = [
         save_interval=500,
         keep_period=2000,
     ),
+    # SMOKE-4TASK: cheap gate on tasks 0, 5, 76, 77 (800 episodes, ~1.6M frames of 211M).
+    # Purpose is "does the pipeline run end to end and does loss move", not learning:
+    # data load, video decode, 61-D proprio reduction, skill/prompt assembly, FAST
+    # tokenization, fwd/bwd, FSDP sharding, checkpoint save. Batch is deliberately small
+    # so iterations are fast; real-scale memory is what the 5-task smoke below checks.
+    #
+    # Task choice spans both halves of the embedding table on purpose: 0 and 5 fall in
+    # rows 0..49, which PiBehaviorWeightLoader fills from Ilia's 50-task checkpoint, while
+    # 76 and 77 land in the randomly-initialised rows 50..99. A smoke test on warm-started
+    # tasks only would not exercise the fresh-embedding path at all.
+    #
+    # Needs its own assets dir (norm_stats + fast_tokenizer) under
+    # ./outputs/assets/pi_behavior_b1k_100_smoke_4task/behavior-1k/2026-challenge-demos.
+    TrainConfig(
+        name="pi_behavior_b1k_100_smoke_4task",
+        exp_name="smoke4",
+        project_name="B1K",
+        model=pi_behavior_config.PiBehaviorConfig(
+            action_horizon=30,
+            action_dim=32,
+            num_tasks=100,
+            max_lang_tokens=128,
+            use_correlated_noise=True,
+            correlation_beta=0.5,
+            use_fast_auxiliary=True,
+            fast_loss_weight=0.05,
+            fast_encoded_dims="0:6,7:23",
+            fast_vocab_size=1024,
+            max_fast_tokens=200,
+            use_kv_transform=True,
+            use_knowledge_insulation=False,
+            subtask_loss_weight=0.1,
+            freeze_vision_backbone=True,
+        ),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2026-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=False,
+                # RGB-only hardlinked view of the official set. Identical content, but
+                # info.json drops the depth_linear features we never downloaded --
+                # LeRobotDataset walks meta.video_keys checking each file exists, and a
+                # declared-but-absent depth video makes it fall back to fetching from the
+                # Hub on every construction. Swap to 2026-challenge-demos-224 once the
+                # rebuild lands.
+                behavior_dataset_root="/work/markhsp/datasets/2026-challenge-demos-rgbonly",
+                use_per_timestamp_norm=True,
+                # Task T owns episodes T*200 .. T*200+199. PyArrow predicate pushdown
+                # means only the matching rows are materialised, so the Arrow cache is
+                # a couple of GB rather than the ~61 GB a full-set load builds.
+                episodes_index=(
+                    list(range(0, 200))          # task 0  (warm-started embedding)
+                    + list(range(1000, 1200))    # task 5  (warm-started embedding)
+                    + list(range(15200, 15400))  # task 76 (random-init embedding)
+                    + list(range(15400, 15600))  # task 77 (random-init embedding)
+                ),
+            ),
+            use_delta_joint_actions=True,
+            use_fast_tokenization=True,
+            annotations_dir="/work/markhsp/datasets/behavior-1k-2026-challenge-demos/annotations",
+            task_prompts_path="/work/markhsp/datasets/behavior-1k-2026-challenge-demos/meta/tasks.jsonl",
+            episodes_per_task=200,
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10,
+            peak_lr=1e-4,
+            decay_steps=100,
+            decay_lr=1e-5,
+        ),
+        num_flow_samples=15,
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            "/work/markhsp/models/behavior_50t_checkpoint/params"
+        ),
+        num_train_steps=100,
+        # Default log_interval is 100, which with num_train_steps=100 (steps 0..99) logs
+        # exactly once, at step 0 — enough to prove the losses are wired up, useless for
+        # confirming they go down. 10 gives a trend without flooding the log.
+        log_interval=10,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=16,
+        batch_size=256,            # 32/GPU across 8 — fast iterations, not real scale
+        save_interval=50,          # exercises checkpoint write within the run
+        keep_period=100,
+        fsdp_devices=8,
+        wandb_enabled=False,
+    ),
+    # PILOT-4TASK: real training run on tasks 0, 5, 76, 77 (800 episodes, 4.79M frames).
+    # Purpose is "does it actually learn", not a deployable model -- 50k steps at batch 256
+    # is ~2.7 epochs over the subset. Watch the three losses separately, not just the total:
+    #   action_loss   falling  -> the flow-matching objective is learning
+    #   subtask_loss  falling from ~4.6 (== ln 34) -> skill_pred_from_vlm is genuinely
+    #                 predicting the skill, i.e. the 50% prompt dropout kept it honest
+    #                 rather than letting it read the answer out of the text
+    #   fast_loss     falling  -> the retrained FAST tokenizer matches the auxiliary head
+    #
+    # Do NOT seed the 100-task run from this checkpoint: training on 4 tasks overfits the
+    # shared backbone to them, and the other 96 task_embedding rows receive no gradient.
+    TrainConfig(
+        name="pi_behavior_b1k_4task_pilot",
+        exp_name="pilot",
+        project_name="B1K",
+        model=pi_behavior_config.PiBehaviorConfig(
+            action_horizon=30,
+            action_dim=32,
+            num_tasks=100,
+            max_lang_tokens=128,
+            use_correlated_noise=True,
+            correlation_beta=0.5,
+            use_fast_auxiliary=True,
+            fast_loss_weight=0.05,
+            fast_encoded_dims="0:6,7:23",
+            fast_vocab_size=1024,
+            max_fast_tokens=200,
+            use_kv_transform=True,
+            use_knowledge_insulation=False,
+            subtask_loss_weight=0.1,
+            freeze_vision_backbone=True,
+        ),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2026-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=False,
+                # RGB-only hardlinked view; switch to 2026-challenge-demos-224 once that
+                # rebuild finishes (its videos are still being written).
+                behavior_dataset_root="/work/markhsp/datasets/2026-challenge-demos-rgbonly",
+                use_per_timestamp_norm=True,
+                episodes_index=(
+                    list(range(0, 200))          # task 0  (warm-started embedding)
+                    + list(range(1000, 1200))    # task 5  (warm-started embedding)
+                    + list(range(15200, 15400))  # task 76 (random-init embedding)
+                    + list(range(15400, 15600))  # task 77 (random-init embedding)
+                ),
+            ),
+            use_delta_joint_actions=True,
+            use_fast_tokenization=True,
+            annotations_dir="/work/markhsp/datasets/behavior-1k-2026-challenge-demos/annotations",
+            task_prompts_path="/work/markhsp/datasets/behavior-1k-2026-challenge-demos/meta/tasks.jsonl",
+            episodes_per_task=200,
+        ),
+        # Ilia's peak LR, decayed across the full run rather than their 20k-then-flat
+        # (that shape was tied to a 200k-step schedule).
+        # 1k warmup, cosine down to 1e-5 by step 10k, then flat 1e-5 for the back half.
+        # optax's cosine schedule clamps its step count, so decay_steps < num_train_steps
+        # holds at decay_lr rather than continuing the curve — verified at 12k/15k/20k.
+        # Same shape as Ilia's (decay early, then constant), scaled to a 20k run.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-4,
+            decay_steps=10_000,
+            decay_lr=1e-5,
+        ),
+        num_flow_samples=15,
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            "/work/markhsp/models/behavior_50t_checkpoint/params"
+        ),
+        # 20k x 1024 = 20.5M samples = ~4.3 epochs over the 4.79M-frame subset. Step count
+        # and batch have to be chosen together: the same 20k steps at batch 2048 would be
+        # ~8.6 epochs on four tasks, which measures memorisation rather than learning.
+        num_train_steps=20_000,
+        log_interval=10,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        # 80 workers because the 224 rebuild is SIGSTOPped and all 240 cores are free. At
+        # batch 256 with 8 workers the GPUs sat at 0% utilisation using 11.5/143.8 GB --
+        # starved, not memory-bound. Batch size was never the constraint; feed rate was.
+        num_workers=80,
+        # Ilia's validated pair is batch 2048 + peak_lr 1e-4; at 1024 the per-sample step
+        # is 2x theirs (at 256 it was 8x).
+        batch_size=1024,
+        # A save is ~43 GB and stalls the step loop for minutes. keep_period retains
+        # 5k/10k/15k/20k.
+        save_interval=2000,
+        keep_period=5_000,
+        fsdp_devices=8,
+        wandb_enabled=False,
+    ),
     # SMOKE: 500-step run on 5 diverse tasks (mix of 2025 and 2026 halves).
     # Goal: catch bugs in the new prompt/skill pipeline before committing to full-scale.
     # Uses Ilia's 50t norm_stats + FAST tokenizer symlinked into ./outputs/assets.
@@ -441,11 +621,13 @@ _CONFIGS = [
             repo_id="behavior-1k/2026-challenge-demos",
             base_config=DataConfig(
                 prompt_from_task=False,
-                behavior_dataset_root="/work/markhsp/datasets/lerobot/b1k_2026_all_tasks",
+                behavior_dataset_root="/work/markhsp/datasets/behavior-1k-2026-challenge-demos",
                 use_per_timestamp_norm=True,
-                # 5 diverse tasks (0, 50, 51, 60, 80) = 1000 episodes. The monkeypatch
-                # in create_behavior_dataset remaps global episode_index → compact tensor
-                # position, so non-contiguous filters like this now work.
+                # 5 diverse tasks (0, 50, 51, 60, 80) = 1000 episodes. Episode ids are
+                # global and contiguous per task: task T owns T*200 .. T*200+199
+                # (verified against meta/episodes for all 100 tasks). lerobot >= 0.4.0
+                # resolves them via meta.episodes[global_idx], so non-contiguous filters
+                # like this work directly — no index remapping needed.
                 episodes_index=(
                     list(range(0, 200))            # task 0
                     + list(range(10000, 10200))    # task 50
@@ -508,7 +690,7 @@ _CONFIGS = [
             repo_id="behavior-1k/2026-challenge-demos",
             base_config=DataConfig(
                 prompt_from_task=False,
-                behavior_dataset_root="/work/markhsp/datasets/lerobot/b1k_2026_all_tasks",
+                behavior_dataset_root="/work/markhsp/datasets/behavior-1k-2026-challenge-demos",
                 use_per_timestamp_norm=True,
                 # No episode filter → full 40M-frame training set (all 100 tasks × 200 eps).
                 episodes_index=None,
