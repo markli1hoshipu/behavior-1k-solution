@@ -320,8 +320,13 @@ class TaskIndexToPromptTokens(DataTransformFn):
             lang_mask.astype(bool),
         ], axis=0)
 
+        # skill_name is an intermediate only: AnnotateSkillFromAnnotation emits it so the
+        # prompt can be rendered here, and it must not survive into the batch. It is a
+        # Python str, which collates to a numpy unicode array and makes JAX raise
+        # "Dtype <U16 is not a valid JAX array type" at device_put.
+        out = {k: v for k, v in data.items() if k != "skill_name"}
         return {
-            **data,
+            **out,
             "tokenized_prompt": prompt_tokens,
             "tokenized_prompt_mask": prompt_mask,
             "subtask_progress": np.asarray(subtask_progress, dtype=np.float32),
