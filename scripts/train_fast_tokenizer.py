@@ -53,6 +53,77 @@ def apply_delta_transform(state: np.ndarray, actions: np.ndarray, mask) -> np.nd
     return delta_actions
 
 
+def _chunks_from_arrays(states, raw_actions, delta_mask, action_horizon, sample_fraction, seed):
+    """Sliding-window delta action chunks for one episode, vectorized.
+
+    Every action in a chunk is expressed relative to the FIRST state of that chunk —
+    this must match compute_norm_stats exactly or the tokenizer is trained on a
+    different distribution than the model sees.
+    """
+    n_chunks = len(states) - action_horizon + 1
+    if n_chunks <= 0:
+        return None
+
+    idx = np.arange(n_chunks)[:, None] + np.arange(action_horizon)[None, :]
+    future = raw_actions[idx]                    # [n_chunks, H, D]
+    cur = states[:n_chunks][:, None, :]          # [n_chunks, 1, D]
+    chunks = future.copy()
+    if delta_mask is not None:
+        mask = np.asarray(delta_mask)
+        dims = mask.shape[-1]
+        chunks[..., :dims] = np.where(
+            mask, future[..., :dims] - cur[..., :dims], future[..., :dims]
+        )
+
+    if sample_fraction < 1.0:
+        n_samples = max(1, int(len(chunks) * sample_fraction))
+        if n_samples < len(chunks):
+            rng = np.random.RandomState(seed % (2**31))
+            chunks = chunks[rng.choice(len(chunks), size=n_samples, replace=False)]
+    return chunks
+
+
+def process_v3_file(args):
+    """Process one LeRobot v3.0 parquet file, which holds MANY episodes.
+
+    v2.1 wrote one episode per file; v3.0 concatenates them into
+    data/chunk-XXX/file-YYY.parquet. Chunks are built per episode so a sliding window
+    never straddles a boundary between two demonstrations.
+
+    Returns a list of chunk arrays (one per episode) for the caller to concatenate.
+    """
+    parquet_file, wanted_episodes, delta_mask, action_horizon, sample_fraction = args
+    out = []
+    try:
+        df = pd.read_parquet(
+            parquet_file, columns=["episode_index", "observation.state", "action"]
+        )
+        ep_col = df["episode_index"].to_numpy()
+        if wanted_episodes is not None:
+            keep = np.isin(ep_col, wanted_episodes)
+            if not keep.any():
+                return out
+            df = df[keep]
+            ep_col = ep_col[keep]
+
+        # extract_state_from_proprio is width-dispatched (61 -> 2026, 256 -> 2025).
+        states_all = extract_state_from_proprio(np.stack(df["observation.state"].to_numpy()))
+        actions_all = np.stack(df["action"].to_numpy())
+
+        for ep in np.unique(ep_col):
+            sel = ep_col == ep
+            c = _chunks_from_arrays(
+                states_all[sel], actions_all[sel], delta_mask,
+                action_horizon, sample_fraction, seed=int(ep),
+            )
+            if c is not None and len(c):
+                out.append(c)
+        return out
+    except Exception as e:
+        print(f"Error processing {parquet_file}: {e}")
+        return out
+
+
 def process_episode_file(args):
     """Process episode file and return action chunks."""
     episode_file, delta_mask, action_horizon, sample_fraction = args
@@ -254,31 +325,61 @@ def main(
     print(f"Action horizon: {action_horizon}")
     print(f"Delta mask: {delta_mask}")
     
-    # Find episode files
+    # Find the data files. v3.0 packs many episodes per file; v2.1 wrote one per file.
     data_root = Path(data_config.behavior_dataset_root)
-    all_episode_files = sorted(data_root.glob("data/task-*/episode_*.parquet"))
-
-    episode_files = all_episode_files
-    print(f"Using all {len(episode_files)} episodes")
-    
-    if max_episodes is not None:
-        episode_files = episode_files[:max_episodes]
-        print(f"Limited to {len(episode_files)} episodes")
-    
-    # Process episodes in parallel
-    num_workers = num_workers or min(32, len(episode_files))
-    args_list = [
-        (f, delta_mask, action_horizon, sample_fraction)
-        for f in episode_files
-    ]
-    
-    print(f"\nProcessing episodes with {num_workers} workers...")
+    v3_files = sorted(data_root.glob("data/chunk-*/file-*.parquet"))
     all_chunks = []
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        for chunks in executor.map(process_episode_file, args_list):
-            if chunks is not None:
-                all_chunks.append(chunks)
-    
+
+    if v3_files:
+        wanted = data_config.episodes_index
+        wanted_arr = np.asarray(sorted(wanted)) if wanted else None
+        print(f"Layout: LeRobot v3.0 — {len(v3_files)} parquet files under {data_root}/data")
+        print(f"Episode filter: {len(wanted_arr) if wanted_arr is not None else 'all'} episodes"
+              + (f" (tasks {sorted({int(e)//200 for e in wanted_arr})})" if wanted_arr is not None else ""))
+        if max_episodes is not None and wanted_arr is not None:
+            wanted_arr = wanted_arr[:max_episodes]
+            print(f"Limited to {len(wanted_arr)} episodes")
+
+        num_workers = num_workers or min(32, len(v3_files))
+        args_list = [
+            (f, wanted_arr, delta_mask, action_horizon, sample_fraction) for f in v3_files
+        ]
+        print(f"\nProcessing with {num_workers} workers...")
+        n_ep = done = 0
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            for per_file in executor.map(process_v3_file, args_list):
+                all_chunks.extend(per_file)
+                n_ep += len(per_file)
+                done += 1
+                if done % 100 == 0 or done == len(v3_files):
+                    print(f"Scanned {done}/{len(v3_files)} files, {n_ep} episodes so far...",
+                          flush=True)
+        if not all_chunks:
+            raise ValueError(
+                "No episodes matched. Check that the config's episodes_index overlaps "
+                f"the episode_index values present in {data_root}/data."
+            )
+    else:
+        all_episode_files = sorted(data_root.glob("data/task-*/episode_*.parquet"))
+        episode_files = all_episode_files
+        print(f"Using all {len(episode_files)} episodes")
+
+        if max_episodes is not None:
+            episode_files = episode_files[:max_episodes]
+            print(f"Limited to {len(episode_files)} episodes")
+
+        num_workers = num_workers or min(32, len(episode_files))
+        args_list = [
+            (f, delta_mask, action_horizon, sample_fraction)
+            for f in episode_files
+        ]
+
+        print(f"\nProcessing episodes with {num_workers} workers...")
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            for chunks in executor.map(process_episode_file, args_list):
+                if chunks is not None:
+                    all_chunks.append(chunks)
+
     # Concatenate all chunks
     all_chunks = np.concatenate(all_chunks, axis=0)
     print(f"Collected {len(all_chunks)} action chunks")
