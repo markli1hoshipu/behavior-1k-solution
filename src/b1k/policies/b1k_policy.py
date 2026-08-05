@@ -12,12 +12,14 @@ import numpy as np
 
 from openpi import transforms
 from openpi.models import model as _model
-try:
-    # Prefer the real omnigibson definition when the sim is installed (eval env)
-    from omnigibson.learning.utils.eval_utils import PROPRIOCEPTION_INDICES  # type: ignore
-except ImportError:
-    # Training-only environment: use vendored copy.
-    from b1k.shared.proprio_constants import PROPRIOCEPTION_INDICES
+
+# Deliberately NOT imported from omnigibson: the pinned BEHAVIOR-1K submodule ships the
+# 2025 (256-D) table, which would silently mis-slice the 2026 (61-D) data whenever the
+# simulator happens to be installed. The vendored module carries both, keyed by width.
+from b1k.shared.proprio_constants import (
+    PROPRIO_SPECS_BY_WIDTH,
+    STATE_ACTION_DIM,
+)
 
 
 def make_b1k_example() -> dict:
@@ -30,35 +32,64 @@ def make_b1k_example() -> dict:
         "prompt": "do something",
     }
 
+# Physical gripper travel, used to map raw width onto the action space's [-1, 1].
+# From the 2025 q99 statistics; re-check against per-year norm stats if grippers look
+# saturated at one end.
+MAX_GRIPPER_WIDTH = 0.1
+
+
 def extract_state_from_proprio(proprio_data):
+    """Reduce raw R1Pro proprioception to the 23-D vector the model consumes.
+
+    Layout matches the official ACTION_QPOS_INDICES so state and action align
+    dimension-for-dimension:
+        [0:3]   base_qvel
+        [3:7]   trunk_qpos      (torso)
+        [7:14]  arm_left_qpos
+        [14]    left gripper    (normalized to [-1, 1])
+        [15:22] arm_right_qpos
+        [22]    right gripper   (normalized to [-1, 1])
+
+    The index table is chosen from the trailing dimension (61 -> 2026, 256 -> 2025)
+    because the two years' layouts overlap in field names but not offsets, so guessing
+    wrong yields plausible-looking garbage instead of an error. Input that is already
+    reduced to 23 dims is passed through unchanged; anything else raises.
+
+    We assume perfect correlation for the two gripper fingers (their qpos is summed).
     """
-    We assume perfect correlation for the two gripper fingers.
-    """
-    # extract joint position
-    base_qvel = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["base_qvel"]]  # 3
-    trunk_qpos = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["trunk_qpos"]]  # 4
-    arm_left_qpos = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["arm_left_qpos"]]  #  7
-    arm_right_qpos = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["arm_right_qpos"]]  #  7
-    
-    # Extract raw gripper widths and normalize to [-1, 1] to match action space
-    left_gripper_raw = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["gripper_left_qpos"]].sum(axis=-1, keepdims=True)
-    right_gripper_raw = proprio_data[..., PROPRIOCEPTION_INDICES["R1Pro"]["gripper_right_qpos"]].sum(axis=-1, keepdims=True)
-    
-    # Normalize gripper widths from [0, 0.1] to [-1, 1] 
-    # Based on statistics: physical range is [0, 0.1], action range is [-1, 1]
-    # Formula: normalized = 2 * (raw / max_width) - 1
-    MAX_GRIPPER_WIDTH = 0.1  # From statistics q99 values
+    width = np.shape(proprio_data)[-1]
+
+    if width == STATE_ACTION_DIM:
+        # Already the reduced vector (e.g. a pre-baked dataset). Nothing to do.
+        return np.asarray(proprio_data)
+
+    spec = PROPRIO_SPECS_BY_WIDTH.get(width)
+    if spec is None:
+        raise ValueError(
+            f"Unsupported proprioception width {width}: expected {STATE_ACTION_DIM} "
+            f"(already reduced) or one of {sorted(PROPRIO_SPECS_BY_WIDTH)} "
+            f"(2026 / 2025 raw R1Pro proprio)."
+        )
+    idx = spec["R1Pro"]
+
+    base_qvel = proprio_data[..., idx["base_qvel"]]            # 3
+    trunk_qpos = proprio_data[..., idx["trunk_qpos"]]          # 4
+    arm_left_qpos = proprio_data[..., idx["arm_left_qpos"]]    # 7
+    arm_right_qpos = proprio_data[..., idx["arm_right_qpos"]]  # 7
+
+    # Raw gripper widths -> [-1, 1] to match the action space.
+    left_gripper_raw = proprio_data[..., idx["gripper_left_qpos"]].sum(axis=-1, keepdims=True)
+    right_gripper_raw = proprio_data[..., idx["gripper_right_qpos"]].sum(axis=-1, keepdims=True)
     left_gripper_width = 2.0 * (left_gripper_raw / MAX_GRIPPER_WIDTH) - 1.0
     right_gripper_width = 2.0 * (right_gripper_raw / MAX_GRIPPER_WIDTH) - 1.0
 
-    # Original baseline uses incorrect order for the state
     return np.concatenate([
         base_qvel,
         trunk_qpos,
         arm_left_qpos,
-        left_gripper_width,    # Now normalized [-1, 1]
+        left_gripper_width,
         arm_right_qpos,
-        right_gripper_width,   # Now normalized [-1, 1]
+        right_gripper_width,
     ], axis=-1)
 
 
@@ -78,15 +109,9 @@ class B1kInputs(transforms.DataTransformFn):
 
     def __call__(self, data: dict) -> dict:
 
-        proprio_data = data["observation/state"]
-        # The 2026 LeRobot dataset already stores observation.state as the 23-D
-        # extracted vector (base_qvel[3]+trunk[4]+arm_l[7]+grip_l[1]+arm_r[7]+grip_r[1]),
-        # not the full 256-D R1Pro raw proprio. extract_state_from_proprio was written
-        # for the raw form and would slice out of bounds here. Detect and pass-through.
-        if hasattr(proprio_data, "shape") and proprio_data.shape[-1] == 23:
-            state = np.asarray(proprio_data)
-        else:
-            state = extract_state_from_proprio(proprio_data)
+        # Handles both raw widths (61 = 2026, 256 = 2025) and an already-reduced 23-D
+        # vector; raises on anything unexpected rather than mis-slicing silently.
+        state = extract_state_from_proprio(data["observation/state"])
         if "actions" in data:
             action =  data["actions"]
 

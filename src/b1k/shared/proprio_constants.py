@@ -1,13 +1,52 @@
-"""Vendored proprioception index constants from omnigibson.learning.utils.eval_utils.
+"""Proprioception / action index constants for the BEHAVIOR-1K R1Pro robot.
 
-Copied so that training can run without the full omnigibson (BEHAVIOR-1K simulator)
-install. Keep in sync with:
-  BEHAVIOR-1K/OmniGibson/omnigibson/learning/utils/eval_utils.py
+Vendored so training can run without the omnigibson (BEHAVIOR-1K simulator) install.
+
+IMPORTANT — the layout changed between challenge years, and the two are NOT
+compatible: 2025 packed 256 dims with sin/cos encodings of every joint, while 2026
+packs 61 dims with no sin/cos and adds end-effector pose. Every field the model needs
+exists in both, at completely different offsets, so applying the wrong table silently
+produces garbage rather than an IndexError.
+
+Do not import PROPRIOCEPTION_INDICES from omnigibson to slice dataset rows: the pinned
+BEHAVIOR-1K submodule is the *2025* release and would hand back the 256-D table for
+61-D data. Select by observed width instead — see PROPRIO_SPECS_BY_WIDTH and
+b1k.policies.b1k_policy.extract_state_from_proprio.
+
+Sources:
+  2026: BEHAVIOR-1K origin/main  OmniGibson/omnigibson/eval/utils/eval_utils.py
+  2025: pinned submodule        OmniGibson/omnigibson/learning/utils/eval_utils.py
 """
 from collections import OrderedDict
+
 import numpy as np
 
-PROPRIOCEPTION_INDICES = {
+# --- 2026 challenge (LeRobot v3.0 dataset: observation.state has 61 dims) ---
+PROPRIOCEPTION_INDICES_2026 = {
+    "R1Pro": OrderedDict(
+        {
+            "base_qvel": np.s_[0:3],
+            "arm_left_qpos": np.s_[3:10],
+            "arm_left_qvel": np.s_[10:17],
+            "eef_left_pos": np.s_[17:20],
+            "eef_left_quat": np.s_[20:24],
+            "gripper_left_qpos": np.s_[24:26],
+            "gripper_left_qvel": np.s_[26:28],
+            "arm_right_qpos": np.s_[28:35],
+            "arm_right_qvel": np.s_[35:42],
+            "eef_right_pos": np.s_[42:45],
+            "eef_right_quat": np.s_[45:49],
+            "gripper_right_qpos": np.s_[49:51],
+            "gripper_right_qvel": np.s_[51:53],
+            "trunk_qpos": np.s_[53:57],
+            "trunk_qvel": np.s_[57:61],
+        }
+    ),
+}
+PROPRIO_WIDTH_2026 = 61
+
+# --- 2025 challenge (LeRobot v2.1 dataset: observation.state has 256 dims) ---
+PROPRIOCEPTION_INDICES_2025 = {
     "A1": OrderedDict(
         {
             "joint_qpos": np.s_[0:8],
@@ -62,3 +101,31 @@ PROPRIOCEPTION_INDICES = {
         }
     ),
 }
+PROPRIO_WIDTH_2025 = 256
+
+# Width -> spec. extract_state_from_proprio dispatches on the trailing dim so the same
+# code reads either year's data without a caller-supplied flag.
+PROPRIO_SPECS_BY_WIDTH = {
+    PROPRIO_WIDTH_2026: PROPRIOCEPTION_INDICES_2026,
+    PROPRIO_WIDTH_2025: PROPRIOCEPTION_INDICES_2025,
+}
+
+# Default = the year we train on.
+PROPRIOCEPTION_INDICES = PROPRIOCEPTION_INDICES_2026
+
+# Official 23-D action layout (2026 upstream ACTION_QPOS_INDICES). The reduced state
+# vector the model consumes mirrors this exactly, which is why the two are compared
+# dimension-for-dimension by the delta-action mask.
+ACTION_QPOS_INDICES = {
+    "R1Pro": OrderedDict(
+        {
+            "base": np.s_[0:3],
+            "torso": np.s_[3:7],
+            "left_arm": np.s_[7:14],
+            "left_gripper": np.s_[14:15],
+            "right_arm": np.s_[15:22],
+            "right_gripper": np.s_[22:23],
+        }
+    ),
+}
+STATE_ACTION_DIM = 23
