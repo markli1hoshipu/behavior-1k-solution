@@ -537,13 +537,19 @@ class PiBehavior(_model.BaseModel):
             batch_size_local = obs.tokenized_prompt.shape[0]
 
             # -- language tokens (positions 2..) --
-            lang_token_ids = obs.tokenized_prompt[:, 2:]      # [B, L]
-            lang_token_mask = obs.tokenized_prompt_mask[:, 2:]  # [B, L]
-            lang_tokens_emb = self.PaliGemma.llm(lang_token_ids, method="embed")  # [B, L, D]
-            tokens.append(lang_tokens_emb)
-            input_mask.append(lang_token_mask)
-            # bidirectional attention across the whole language span
-            ar_mask += [False] * lang_tokens_emb.shape[1]
+            # max_lang_tokens=0 gives a width-2 prompt and skips the text span entirely,
+            # reproducing Ilia's 2025 design: PaliGemma's weights still run (images, state,
+            # action expert) but no natural language is fed, and the task is identified
+            # solely by its row in task_embeddings. Guarded rather than relying on a
+            # zero-length slice so nothing downstream has to reason about empty spans.
+            if obs.tokenized_prompt.shape[1] > 2:
+                lang_token_ids = obs.tokenized_prompt[:, 2:]      # [B, L]
+                lang_token_mask = obs.tokenized_prompt_mask[:, 2:]  # [B, L]
+                lang_tokens_emb = self.PaliGemma.llm(lang_token_ids, method="embed")  # [B, L, D]
+                tokens.append(lang_tokens_emb)
+                input_mask.append(lang_token_mask)
+                # bidirectional attention across the whole language span
+                ar_mask += [False] * lang_tokens_emb.shape[1]
 
             # -- task_id + skill_id lookups --
             task_ids = obs.tokenized_prompt[:, 0]  # [B]

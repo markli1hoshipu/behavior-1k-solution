@@ -294,6 +294,18 @@ class TaskIndexToPromptTokens(DataTransformFn):
             prompts = _load_task_prompts(self.task_prompts_path)
         else:
             prompts = {}
+        # max_lang_tokens=0 = no-language arm: emit the width-2 prompt Ilia's model used,
+        # [task_id, skill_id], and skip tokenization entirely. Building a tokenizer with
+        # max_len=0 would be meaningless, and the model's embed_prefix skips the text span
+        # for any prompt of width 2.
+        if self.max_lang_tokens == 0:
+            return {
+                **{k: v for k, v in data.items() if k != "skill_name"},
+                "tokenized_prompt": np.array([task_id, skill_id], dtype=np.int32),
+                "tokenized_prompt_mask": np.array([True, True], dtype=bool),
+                "subtask_progress": np.asarray(subtask_progress, dtype=np.float32),
+            }
+
         task_description = prompts.get(task_id, f"task {task_id}")
 
         # Render the current skill into the text, dropping it on a deterministic subset.
