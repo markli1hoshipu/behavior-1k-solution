@@ -34,8 +34,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import av
 import numpy as np
 
-SRC = pathlib.Path("/work/markhsp/datasets/behavior-1k-2026-challenge-demos")
-DST = pathlib.Path("/work/markhsp/datasets/2026-challenge-demos-224")
+SRC = pathlib.Path("/work6/markhsp/datasets/behavior-1k-2026-challenge-demos")
+DST = pathlib.Path("/work6/markhsp/datasets/2026-challenge-demos-224")
 SIZE = 224
 GOP = 8          # match the source's keyframe spacing: cheap random access
 CRF = 24         # PSNR 36.3 dB (zed, min 34.0) at 0.47x source size; see logs/build_224.log

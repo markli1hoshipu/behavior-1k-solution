@@ -417,7 +417,7 @@ _CONFIGS = [
         save_interval=500,
         keep_period=2000,
     ),
-    # SMOKE-4TASK: cheap gate on tasks 0, 5, 76, 77 (800 episodes, ~1.6M frames of 211M).
+    # SMOKE-5TASK: cheap gate on tasks 0, 5, 76, 77 (800 episodes, ~1.6M frames of 211M).
     # Purpose is "does the pipeline run end to end and does loss move", not learning:
     # data load, video decode, 61-D proprio reduction, skill/prompt assembly, FAST
     # tokenization, fwd/bwd, FSDP sharding, checkpoint save. Batch is deliberately small
@@ -429,10 +429,10 @@ _CONFIGS = [
     # tasks only would not exercise the fresh-embedding path at all.
     #
     # Needs its own assets dir (norm_stats + fast_tokenizer) under
-    # ./outputs/assets/pi_behavior_b1k_100_smoke_4task/behavior-1k/2026-challenge-demos.
+    # ./outputs/assets/pi_behavior_b1k_100_smoke_5task/behavior-1k/2026-challenge-demos.
     TrainConfig(
-        name="pi_behavior_b1k_100_smoke_4task",
-        exp_name="smoke4",
+        name="pi_behavior_b1k_100_smoke_5task",
+        exp_name="smoke5",
         project_name="B1K",
         model=pi_behavior_config.PiBehaviorConfig(
             action_horizon=30,
@@ -461,22 +461,23 @@ _CONFIGS = [
                 # declared-but-absent depth video makes it fall back to fetching from the
                 # Hub on every construction. Swap to 2026-challenge-demos-224 once the
                 # rebuild lands.
-                behavior_dataset_root="/work/markhsp/datasets/2026-challenge-demos-rgbonly",
+                behavior_dataset_root="/work6/markhsp/datasets/2026-challenge-demos-rgbonly",
                 use_per_timestamp_norm=True,
                 # Task T owns episodes T*200 .. T*200+199. PyArrow predicate pushdown
                 # means only the matching rows are materialised, so the Arrow cache is
                 # a couple of GB rather than the ~61 GB a full-set load builds.
                 episodes_index=(
-                    list(range(0, 200))          # task 0  (warm-started embedding)
-                    + list(range(1000, 1200))    # task 5  (warm-started embedding)
-                    + list(range(15200, 15400))  # task 76 (random-init embedding)
-                    + list(range(15400, 15600))  # task 77 (random-init embedding)
+                    list(range(0, 200))          # task 0  turning_on_radio      (warm-start)
+                    + list(range(1000, 1200))    # task 5  setting_mousetraps    (warm-start)
+                    + list(range(8000, 8200))    # task 40 make_microwave_popcorn(warm-start)
+                    + list(range(15200, 15400))  # task 76 dispose_of_glass      (random init)
+                    + list(range(15400, 15600))  # task 77 installing_a_modem    (random init)
                 ),
             ),
             use_delta_joint_actions=True,
             use_fast_tokenization=True,
-            annotations_dir="/work/markhsp/datasets/behavior-1k-2026-challenge-demos/annotations",
-            task_prompts_path="/work/markhsp/datasets/behavior-1k-2026-challenge-demos/meta/tasks.jsonl",
+            annotations_dir="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos/annotations",
+            task_prompts_path="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos/meta/tasks.jsonl",
             episodes_per_task=200,
         ),
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -487,7 +488,7 @@ _CONFIGS = [
         ),
         num_flow_samples=15,
         weight_loader=weight_loaders.PiBehaviorWeightLoader(
-            "/work/markhsp/models/behavior_50t_checkpoint/params"
+            "/work6/markhsp/models/behavior_50t_checkpoint/params"
         ),
         num_train_steps=100,
         # Default log_interval is 100, which with num_train_steps=100 (steps 0..99) logs
@@ -503,7 +504,7 @@ _CONFIGS = [
         fsdp_devices=8,
         wandb_enabled=False,
     ),
-    # PILOT-4TASK: real training run on tasks 0, 5, 76, 77 (800 episodes, 4.79M frames).
+    # PILOT-5TASK: real training run on tasks 0, 5, 40, 76, 77 (1000 episodes, ~6.0M frames).
     # Purpose is "does it actually learn", not a deployable model -- 50k steps at batch 256
     # is ~2.7 epochs over the subset. Watch the three losses separately, not just the total:
     #   action_loss   falling  -> the flow-matching objective is learning
@@ -515,7 +516,7 @@ _CONFIGS = [
     # Do NOT seed the 100-task run from this checkpoint: training on 4 tasks overfits the
     # shared backbone to them, and the other 96 task_embedding rows receive no gradient.
     TrainConfig(
-        name="pi_behavior_b1k_4task_pilot",
+        name="pi_behavior_b1k_5task_pilot",
         exp_name="pilot",
         project_name="B1K",
         model=pi_behavior_config.PiBehaviorConfig(
@@ -541,19 +542,20 @@ _CONFIGS = [
                 prompt_from_task=False,
                 # RGB-only hardlinked view; switch to 2026-challenge-demos-224 once that
                 # rebuild finishes (its videos are still being written).
-                behavior_dataset_root="/work/markhsp/datasets/2026-challenge-demos-rgbonly",
+                behavior_dataset_root="/work6/markhsp/datasets/2026-challenge-demos-rgbonly",
                 use_per_timestamp_norm=True,
                 episodes_index=(
-                    list(range(0, 200))          # task 0  (warm-started embedding)
-                    + list(range(1000, 1200))    # task 5  (warm-started embedding)
-                    + list(range(15200, 15400))  # task 76 (random-init embedding)
-                    + list(range(15400, 15600))  # task 77 (random-init embedding)
+                    list(range(0, 200))          # task 0  turning_on_radio      (warm-start)
+                    + list(range(1000, 1200))    # task 5  setting_mousetraps    (warm-start)
+                    + list(range(8000, 8200))    # task 40 make_microwave_popcorn(warm-start)
+                    + list(range(15200, 15400))  # task 76 dispose_of_glass      (random init)
+                    + list(range(15400, 15600))  # task 77 installing_a_modem    (random init)
                 ),
             ),
             use_delta_joint_actions=True,
             use_fast_tokenization=True,
-            annotations_dir="/work/markhsp/datasets/behavior-1k-2026-challenge-demos/annotations",
-            task_prompts_path="/work/markhsp/datasets/behavior-1k-2026-challenge-demos/meta/tasks.jsonl",
+            annotations_dir="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos/annotations",
+            task_prompts_path="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos/meta/tasks.jsonl",
             episodes_per_task=200,
         ),
         # Ilia's peak LR, decayed across the full run rather than their 20k-then-flat
@@ -570,7 +572,7 @@ _CONFIGS = [
         ),
         num_flow_samples=15,
         weight_loader=weight_loaders.PiBehaviorWeightLoader(
-            "/work/markhsp/models/behavior_50t_checkpoint/params"
+            "/work6/markhsp/models/behavior_50t_checkpoint/params"
         ),
         # 20k x 1024 = 20.5M samples = ~4.3 epochs over the 4.79M-frame subset. Step count
         # and batch have to be chosen together: the same 20k steps at batch 2048 would be
@@ -579,17 +581,133 @@ _CONFIGS = [
         log_interval=10,
         assets_base_dir="./outputs/assets",
         checkpoint_base_dir="./outputs/checkpoints",
-        # 80 workers because the 224 rebuild is SIGSTOPped and all 240 cores are free. At
-        # batch 256 with 8 workers the GPUs sat at 0% utilisation using 11.5/143.8 GB --
-        # starved, not memory-bound. Batch size was never the constraint; feed rate was.
-        num_workers=80,
-        # Ilia's validated pair is batch 2048 + peak_lr 1e-4; at 1024 the per-sample step
-        # is 2x theirs (at 256 it was 8x).
+        # Measured on 16 devices (batch / workers -> s/step, throughput, GPU SM):
+        #   1024 / 80 -> 5.0 s, 205 samples/s, 79% SM, 35.8 GB peak
+        #   2048 / 32 -> 11.6 s, 177 samples/s, 72-79% SM, 79.5 GB peak
+        # Both are GPU-bound rather than starved, so worker count buys less than a naive
+        # per-worker extrapolation suggests: predicting 25 s/step for 2048/32 from the
+        # 1024/80 figures was off by more than 2x, because in the 1024 case the workers
+        # were partly idle waiting on the GPUs. 64 sits between the two measured points.
+        num_workers=64,
+        # 1024 over 8 devices = 128/GPU, the footprint measured at 79.5 GB of 143.8.
+        # 2048 on 8 devices would be 256/GPU (~160 GB) and OOM -- that only fit when the
+        # mesh spanned 16 devices. Both A/B arms must match here or the comparison is
+        # confounded.
         batch_size=1024,
-        # A save is ~43 GB and stalls the step loop for minutes. keep_period retains
-        # 5k/10k/15k/20k.
+        # A save is ~43 GB and stalls the step loop for minutes. Note save_interval does
+        # not divide keep_period, so the only steps both saved and retained are multiples
+        # of 10000; a crash rolls back to the last multiple of 2000 (cost 1430 steps once).
         save_interval=2000,
         keep_period=5_000,
+        # 8, not 16: the two A/B arms run as separate single-node jobs, one per node, so
+        # each sees only its own 8 GPUs. Launch with
+        #   sbatch --nodes=1 --nodelist=gpu-h200-106 scripts/train_slurm.sbatch <config> ...
+        # init_distributed() returns early when SLURM_NTASKS == 1, so no multi-host setup
+        # is involved.
+        fsdp_devices=8,
+        wandb_enabled=False,
+    ),
+    # PILOT-5TASK-NOLANG: the A/B counterpart to pi_behavior_b1k_5task_pilot, identical
+    # in every field except max_lang_tokens=0, which drops the natural-language span from
+    # the prefix and leaves the task identified only by its task_embeddings row -- i.e.
+    # Ilia's 2025 design, which won the challenge without any text input.
+    #
+    # What the comparison is for: the rich descriptions carry object- and step-level detail
+    # ("take the grated cheese, the four pieces of pepperoni ... from their tupperware
+    # containers in the refrigerator") that a single 2048-d embedding plausibly cannot hold,
+    # but that is an argument, not evidence. Run both arms and read action_loss.
+    #
+    # Generated by copying the pilot block verbatim so the two cannot drift; keep them in
+    # sync by hand if either is edited.
+    TrainConfig(
+        name="pi_behavior_b1k_5task_pilot_nolang",
+        exp_name="pilot_nolang",
+        project_name="B1K",
+        model=pi_behavior_config.PiBehaviorConfig(
+            action_horizon=30,
+            action_dim=32,
+            num_tasks=100,
+            max_lang_tokens=0,   # no-language arm
+            use_correlated_noise=True,
+            correlation_beta=0.5,
+            use_fast_auxiliary=True,
+            fast_loss_weight=0.05,
+            fast_encoded_dims="0:6,7:23",
+            fast_vocab_size=1024,
+            max_fast_tokens=200,
+            use_kv_transform=True,
+            use_knowledge_insulation=False,
+            subtask_loss_weight=0.1,
+            freeze_vision_backbone=True,
+        ),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2026-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=False,
+                # RGB-only hardlinked view; switch to 2026-challenge-demos-224 once that
+                # rebuild finishes (its videos are still being written).
+                behavior_dataset_root="/work6/markhsp/datasets/2026-challenge-demos-rgbonly",
+                use_per_timestamp_norm=True,
+                episodes_index=(
+                    list(range(0, 200))          # task 0  turning_on_radio      (warm-start)
+                    + list(range(1000, 1200))    # task 5  setting_mousetraps    (warm-start)
+                    + list(range(8000, 8200))    # task 40 make_microwave_popcorn(warm-start)
+                    + list(range(15200, 15400))  # task 76 dispose_of_glass      (random init)
+                    + list(range(15400, 15600))  # task 77 installing_a_modem    (random init)
+                ),
+            ),
+            use_delta_joint_actions=True,
+            use_fast_tokenization=True,
+            annotations_dir="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos/annotations",
+            task_prompts_path="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos/meta/tasks.jsonl",
+            episodes_per_task=200,
+        ),
+        # Ilia's peak LR, decayed across the full run rather than their 20k-then-flat
+        # (that shape was tied to a 200k-step schedule).
+        # 1k warmup, cosine down to 1e-5 by step 10k, then flat 1e-5 for the back half.
+        # optax's cosine schedule clamps its step count, so decay_steps < num_train_steps
+        # holds at decay_lr rather than continuing the curve — verified at 12k/15k/20k.
+        # Same shape as Ilia's (decay early, then constant), scaled to a 20k run.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-4,
+            decay_steps=10_000,
+            decay_lr=1e-5,
+        ),
+        num_flow_samples=15,
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            "/work6/markhsp/models/behavior_50t_checkpoint/params"
+        ),
+        # 20k x 1024 = 20.5M samples = ~4.3 epochs over the 4.79M-frame subset. Step count
+        # and batch have to be chosen together: the same 20k steps at batch 2048 would be
+        # ~8.6 epochs on four tasks, which measures memorisation rather than learning.
+        num_train_steps=20_000,
+        log_interval=10,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        # Measured on 16 devices (batch / workers -> s/step, throughput, GPU SM):
+        #   1024 / 80 -> 5.0 s, 205 samples/s, 79% SM, 35.8 GB peak
+        #   2048 / 32 -> 11.6 s, 177 samples/s, 72-79% SM, 79.5 GB peak
+        # Both are GPU-bound rather than starved, so worker count buys less than a naive
+        # per-worker extrapolation suggests: predicting 25 s/step for 2048/32 from the
+        # 1024/80 figures was off by more than 2x, because in the 1024 case the workers
+        # were partly idle waiting on the GPUs. 64 sits between the two measured points.
+        num_workers=64,
+        # 1024 over 8 devices = 128/GPU, the footprint measured at 79.5 GB of 143.8.
+        # 2048 on 8 devices would be 256/GPU (~160 GB) and OOM -- that only fit when the
+        # mesh spanned 16 devices. Both A/B arms must match here or the comparison is
+        # confounded.
+        batch_size=1024,
+        # A save is ~43 GB and stalls the step loop for minutes. Note save_interval does
+        # not divide keep_period, so the only steps both saved and retained are multiples
+        # of 10000; a crash rolls back to the last multiple of 2000 (cost 1430 steps once).
+        save_interval=2000,
+        keep_period=5_000,
+        # 8, not 16: the two A/B arms run as separate single-node jobs, one per node, so
+        # each sees only its own 8 GPUs. Launch with
+        #   sbatch --nodes=1 --nodelist=gpu-h200-106 scripts/train_slurm.sbatch <config> ...
+        # init_distributed() returns early when SLURM_NTASKS == 1, so no multi-host setup
+        # is involved.
         fsdp_devices=8,
         wandb_enabled=False,
     ),
@@ -621,7 +739,7 @@ _CONFIGS = [
             repo_id="behavior-1k/2026-challenge-demos",
             base_config=DataConfig(
                 prompt_from_task=False,
-                behavior_dataset_root="/work/markhsp/datasets/behavior-1k-2026-challenge-demos",
+                behavior_dataset_root="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos",
                 use_per_timestamp_norm=True,
                 # 5 diverse tasks (0, 50, 51, 60, 80) = 1000 episodes. Episode ids are
                 # global and contiguous per task: task T owns T*200 .. T*200+199
@@ -638,8 +756,8 @@ _CONFIGS = [
             ),
             use_delta_joint_actions=True,
             use_fast_tokenization=True,
-            annotations_dir="/work/markhsp/datasets/behavior-1k-2026-challenge-demos/annotations",
-            task_prompts_path="/work/markhsp/datasets/behavior-1k-2026-challenge-demos/meta/tasks.jsonl",
+            annotations_dir="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos/annotations",
+            task_prompts_path="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos/meta/tasks.jsonl",
             episodes_per_task=200,
         ),
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -650,7 +768,7 @@ _CONFIGS = [
         ),
         num_flow_samples=15,
         weight_loader=weight_loaders.PiBehaviorWeightLoader(
-            "/work/markhsp/models/behavior_50t_checkpoint/params"
+            "/work6/markhsp/models/behavior_50t_checkpoint/params"
         ),
         num_train_steps=100,       # smoke: catch bugs + verify loss decreases
         assets_base_dir="./outputs/assets",
@@ -690,15 +808,15 @@ _CONFIGS = [
             repo_id="behavior-1k/2026-challenge-demos",
             base_config=DataConfig(
                 prompt_from_task=False,
-                behavior_dataset_root="/work/markhsp/datasets/behavior-1k-2026-challenge-demos",
+                behavior_dataset_root="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos",
                 use_per_timestamp_norm=True,
                 # No episode filter → full 40M-frame training set (all 100 tasks × 200 eps).
                 episodes_index=None,
             ),
             use_delta_joint_actions=True,
             use_fast_tokenization=True,
-            annotations_dir="/work/markhsp/datasets/behavior-1k-2026-challenge-demos/annotations",
-            task_prompts_path="/work/markhsp/datasets/behavior-1k-2026-challenge-demos/meta/tasks.jsonl",
+            annotations_dir="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos/annotations",
+            task_prompts_path="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos/meta/tasks.jsonl",
             episodes_per_task=200,
         ),
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -712,7 +830,7 @@ _CONFIGS = [
         # [50, 2048] → [100, 2048] (top 50 from ckpt, bottom 50 random), drops the old
         # per-task-stage tables (replaced by B1a global skill_embeddings).
         weight_loader=weight_loaders.PiBehaviorWeightLoader(
-            "/work/markhsp/models/behavior_50t_checkpoint/params"
+            "/work6/markhsp/models/behavior_50t_checkpoint/params"
         ),
         num_train_steps=200_000,
         assets_base_dir="./outputs/assets",
