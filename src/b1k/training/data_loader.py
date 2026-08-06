@@ -4,8 +4,10 @@ Reference: https://github.com/wensi-ai/openpi/tree/behavior
 """
 
 import logging
+import multiprocessing
 import time
 
+import jax
 import torch
 
 # Import all base data loading from OpenPI
@@ -25,6 +27,9 @@ from openpi.training.data_loader import (
     create_torch_data_loader,
     create_rlds_data_loader,
 )
+
+from openpi.training.data_loader import _collate_fn as _openpi_collate_fn
+from openpi.training.data_loader import _worker_init_fn as _openpi_worker_init_fn
 
 import openpi.training.config as _config
 import openpi.transforms as _transforms
@@ -71,6 +76,82 @@ class B1kLeRobotDataset(_LeRobotDataset):
             )
             result[key] = torch.stack(self.hf_dataset[relative_indices][key])
         return result
+
+
+class _MultiHostTorchDataLoader:
+    """Torch loader for multi-host JAX, with each rank reading a disjoint shard.
+
+    openpi finished multi-host loading only for the torch.distributed path: its JAX branch
+    divides the batch size by process_count but never shards the *indices*, so
+    TorchDataLoader.__init__ refuses to run at all:
+
+        NotImplementedError("Data loading with multiple processes is not supported.")
+
+    Rather than defeat that guard (patching jax.process_count globally would also corrupt
+    checkpoints.py, which branches on jax.process_index()), this builds the torch loader
+    directly. It is deliberately a near-copy of TorchDataLoader with two differences: a
+    DistributedSampler supplies the per-rank shard, and there is no guard. openpi's own
+    collate and worker-init are reused so batch layout cannot drift from the single-host
+    path.
+
+    Correctness rests on the sampler: jax.make_array_from_process_local_data assembles the
+    global array from each rank's slice, so if the ranks drew overlapping samples the global
+    batch would silently contain duplicates -- a smaller effective batch and correlated
+    gradients, with no error.
+    """
+
+    def __init__(
+        self,
+        dataset,
+        *,
+        local_batch_size: int,
+        sharding,
+        sampler,
+        num_batches: int | None = None,
+        num_workers: int = 0,
+        seed: int = 0,
+    ):
+        if len(dataset) < local_batch_size:
+            raise ValueError(
+                f"Local batch size ({local_batch_size}) is larger than the dataset "
+                f"size ({len(dataset)})."
+            )
+        self._sharding = sharding
+        self._num_batches = num_batches
+        self._sampler = sampler
+
+        mp_context = multiprocessing.get_context("spawn") if num_workers > 0 else None
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        self._data_loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=local_batch_size,
+            shuffle=False,          # the sampler owns ordering
+            sampler=sampler,
+            num_workers=num_workers,
+            multiprocessing_context=mp_context,
+            persistent_workers=num_workers > 0,
+            collate_fn=_openpi_collate_fn,
+            worker_init_fn=_openpi_worker_init_fn,
+            drop_last=True,
+            generator=generator,
+        )
+
+    def __iter__(self):
+        num_items = 0
+        epoch = 0
+        while True:
+            # DistributedSampler reseeds from its epoch; without this every pass over the
+            # shard would repeat the same order.
+            self._sampler.set_epoch(epoch)
+            epoch += 1
+            for batch in self._data_loader:
+                if self._num_batches is not None and num_items >= self._num_batches:
+                    return
+                num_items += 1
+                yield jax.tree.map(
+                    lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch
+                )
 
 
 class DataLoaderImpl(DataLoader):
@@ -242,14 +323,56 @@ def create_behavior_data_loader(
     dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon, seed=seed)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
 
-    data_loader = TorchDataLoader(
+    # Multi-host data loading. openpi finished this only for the torch.distributed path:
+    # its JAX branch divides the batch size by process_count but never shards the *indices*,
+    # so TorchDataLoader.__init__ guards with
+    #     NotImplementedError("Data loading with multiple processes is not supported.")
+    # The rest of the machinery is already there -- __iter__ assembles the global array with
+    # jax.make_array_from_process_local_data, which is exactly the multi-host API.
+    #
+    # What was missing is that each rank must see a *disjoint* shard. Without that, both
+    # ranks draw from the whole dataset and the assembled global batch contains duplicated
+    # samples: no error, just a smaller effective batch and correlated gradients.
+    # DistributedSampler gives disjoint shards from a shared seed. TorchDataLoader already
+    # accepts a sampler and disables its own shuffle when one is passed.
+    n_proc = jax.process_count()
+    local_batch_size = config.batch_size // n_proc
+
+    if n_proc == 1:
+        return DataLoaderImpl(
+            data_config,
+            TorchDataLoader(
+                dataset,
+                local_batch_size=local_batch_size,
+                sharding=sharding,
+                shuffle=shuffle,
+                num_batches=num_batches,
+                num_workers=config.num_workers,
+                seed=seed,
+            ),
+        )
+
+    sampler = torch.utils.data.distributed.DistributedSampler(
         dataset,
-        local_batch_size=config.batch_size // jax.process_count(),
-        sharding=sharding,
+        num_replicas=n_proc,
+        rank=jax.process_index(),
         shuffle=shuffle,
-        num_batches=num_batches,
-        num_workers=config.num_workers,
         seed=seed,
+        drop_last=True,
     )
-    
-    return DataLoaderImpl(data_config, data_loader)
+    logging.info(
+        f"multi-host data loading: rank {jax.process_index()}/{n_proc}, "
+        f"{len(sampler)} of {len(dataset)} samples, local_batch_size={local_batch_size}"
+    )
+    return DataLoaderImpl(
+        data_config,
+        _MultiHostTorchDataLoader(
+            dataset,
+            local_batch_size=local_batch_size,
+            sharding=sharding,
+            sampler=sampler,
+            num_batches=num_batches,
+            num_workers=config.num_workers,
+            seed=seed,
+        ),
+    )
