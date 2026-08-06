@@ -9,6 +9,7 @@ import functools
 import logging
 import os
 import platform
+import subprocess
 import time
 from typing import Any
 
@@ -24,7 +25,16 @@ import optax
 import tqdm_loggable.auto as tqdm
 import wandb
 
-# Configure JAX memory allocation to prevent OOM errors
+# Configure JAX memory allocation to prevent OOM errors.
+#
+# 'platform' is a non-caching allocator: every request goes straight to the CUDA driver.
+# It was briefly removed in favour of the default BFC allocator, on the theory that
+# driver-level fragmentation explained an OOM at step 5430 (a 72.53 GiB contiguous request
+# failed on device 5 while the steady-state peak is only ~79.5 GB of 143.8). That made
+# things worse, not better: BFC reserves MEM_FRACTION of the device up front (133 GB of
+# 143.8 observed), leaving almost nothing for NCCL's communication buffers, which are
+# allocated outside JAX's arena. The symptom was GPU SM pinned at 0% with the main process
+# burning 800% CPU in futex_wait -- collectives unable to get memory. Keep 'platform'.
 os.environ.setdefault('XLA_PYTHON_CLIENT_MEM_FRACTION', '0.9')
 os.environ.setdefault('XLA_PYTHON_CLIENT_ALLOCATOR', 'platform')
 
@@ -334,8 +344,65 @@ def train_step(
     return new_state, info
 
 
+def init_distributed() -> None:
+    """Join the multi-host JAX cluster when launched under Slurm with >1 task.
+
+    Must run before anything touches JAX, because jax.device_count() and the backend
+    are fixed at first use. Without it, `srun --nodes=2` simply starts two independent
+    single-host jobs that each see 8 GPUs and compute unrelated gradients -- no error,
+    just silently wrong training.
+
+    Single-node runs are left alone: SLURM_NTASKS is unset or 1, so plain
+    `python scripts/train.py ...` keeps working.
+    """
+    ntasks = int(os.environ.get("SLURM_NTASKS", "1"))
+    if ntasks <= 1:
+        return
+
+    # SLURM_STEP_NODELIST is in compressed form ("gpu-h200-[106-107]"); scontrol expands it.
+    nodelist = os.environ.get("SLURM_STEP_NODELIST") or os.environ["SLURM_NODELIST"]
+    head = subprocess.run(
+        ["scontrol", "show", "hostnames", nodelist],
+        check=True, capture_output=True, text=True,
+    ).stdout.split()[0]
+    port = os.environ.get("JAX_COORDINATOR_PORT", "12355")
+    process_id = int(os.environ["SLURM_PROCID"])
+
+    # local_device_ids must be explicit. Left to itself, JAX's Slurm auto-detection
+    # assigns one GPU per task via SLURM_LOCALID -- the convention for --ntasks-per-gpu
+    # launches. We run one task per *node* owning all 8 of its GPUs, so that default
+    # yielded "2 global devices, 1 local" and the mesh build failed with
+    # "Number of devices 2 must be divisible by the number of FSDP devices 16".
+    n_local = int(os.environ.get("SLURM_GPUS_ON_NODE", "0")) or len(
+        [d for d in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if d]
+    )
+    if n_local == 0:
+        raise RuntimeError(
+            "Cannot determine local GPU count: neither SLURM_GPUS_ON_NODE nor "
+            "CUDA_VISIBLE_DEVICES is set."
+        )
+    local_device_ids = list(range(n_local))
+
+    logging.info(
+        f"jax.distributed.initialize: coordinator={head}:{port} "
+        f"process {process_id}/{ntasks} on {platform.node()}, "
+        f"local_device_ids={local_device_ids}"
+    )
+    jax.distributed.initialize(
+        coordinator_address=f"{head}:{port}",
+        num_processes=ntasks,
+        process_id=process_id,
+        local_device_ids=local_device_ids,
+    )
+    logging.info(
+        f"cluster joined: {jax.device_count()} global devices, "
+        f"{jax.local_device_count()} local, process_index={jax.process_index()}"
+    )
+
+
 def main(config: _config.TrainConfig):
     init_logging()
+    init_distributed()
     logging.info(f"Running on: {platform.node()}")
 
     if config.batch_size % jax.device_count() != 0:
