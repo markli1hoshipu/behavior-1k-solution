@@ -158,13 +158,37 @@ def main(args: Args) -> None:
     else:
         logging.info("Eval tricks DISABLED (default behavior)")
 
+    # Prompt width and text source come from the checkpoint's own config, so one server
+    # handles both A/B arms: max_lang_tokens == 0 emits [task_id, skill_id], otherwise the
+    # rich description is re-tokenized per step from the *predicted* skill. Getting this
+    # from the config rather than a flag means an arm cannot be served with the wrong width.
+    max_lang_tokens = getattr(config.model, "max_lang_tokens", 0)
+    task_prompts = {}
+    if max_lang_tokens > 0:
+        prompts_path = getattr(config.data, "task_prompts_path", "") or getattr(
+            config.model, "task_prompts_path", ""
+        )
+        if prompts_path:
+            from b1k.transforms import _load_task_prompts
+
+            task_prompts = _load_task_prompts(prompts_path)
+            logging.info(f"language arm: {len(task_prompts)} task prompts, "
+                         f"max_lang_tokens={max_lang_tokens}")
+        else:
+            logging.warning("max_lang_tokens > 0 but no task_prompts_path; prompts will be "
+                            "placeholders and will not match training")
+    else:
+        logging.info("no-language arm: prompt is [task_id, skill_id]")
+
     # Create B1K wrapper with PI_BEHAVIOR-specific features
     policy = B1KPolicyWrapper(
         policy, 
         text_prompt=prompt,  # Not used by PI_BEHAVIOR, kept for compatibility
         task_id=task_id,
         config=wrapper_config,
-        checkpoint_switcher=checkpoint_switcher
+        checkpoint_switcher=checkpoint_switcher,
+        max_lang_tokens=max_lang_tokens,
+        task_prompts=task_prompts,
     )
     
     if checkpoint_switcher:

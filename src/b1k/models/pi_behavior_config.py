@@ -34,6 +34,28 @@ SKILL_ID_TO_IDX = {
     94: 27, 95: 28, 98: 29, 99: 30, 100: 31, 101: 32, 102: 33,
 }
 NUM_SKILLS = len(SKILL_ID_TO_IDX)  # 34
+
+# Inverse map: dense index -> raw skill_id. skill_pred_from_vlm emits logits over the
+# dense range, but tokenized_prompt[1] carries the *raw* id (SKILL_ID_LUT maps raw->dense
+# inside the model). At eval there is no annotation, so the predicted dense index has to
+# be converted back before it can be fed in as the next step's skill.
+SKILL_IDX_TO_ID = {v: k for k, v in SKILL_ID_TO_IDX.items()}
+
+# Human-readable names, enumerated from the 2026 annotations' skill_description field.
+# Needed by the language arm at eval: the prompt must be rebuilt with the same wording
+# training used, from the *predicted* skill rather than a ground-truth one.
+SKILL_ID_TO_NAME = {
+    1: "move to",          2: "pick up from",   3: "place on",       4: "place in",
+    5: "hand over",        6: "toggle",         8: "open",           9: "open drawer",
+    10: "open door",       11: "close drawer",  12: "close door",    13: "open lid",
+    14: "close lid",       19: "wipe",          28: "pour",          34: "cut",
+    46: "spray",           50: "fill",          61: "soak",          67: "press",
+    69: "fold",            70: "unfold",        88: "shake",         90: "push to",
+    91: "place on next to", 92: "place in next to", 93: "turn to",    94: "swing",
+    95: "stir",            98: "scrub",         99: "sweep",         100: "insert",
+    101: "attach",         102: "detach",
+}
+UNKNOWN_SKILL_NAME = "unknown"
 UNKNOWN_SKILL_ID = 0  # sentinel for missing / padding
 # Dense lookup table: raw skill_id (0..MAX_SKILL_ID_KEY) -> idx into skill_embeddings.
 # Out-of-vocab keys map to 0 (unknown). Built as a tuple so import-time is JAX-free.

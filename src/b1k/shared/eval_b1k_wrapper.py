@@ -9,17 +9,7 @@ from collections import deque
 from openpi_client.base_policy import BasePolicy
 from openpi_client.image_tools import resize_with_pad
 from b1k.policies.b1k_policy import extract_state_from_proprio
-# B1a: TASK_NUM_STAGES was retired when we switched from time-slicing stages to
-# annotation-based skill_ids. This wrapper's stage-clamping/logging logic still needs
-# a per-task max-stage value; until we rewrite it for skill_ids, fall back to a
-# generous cap. Real stage-count comes from the annotation JSON at eval time.
-_LEGACY_MAX_STAGE_FALLBACK = 15
-class _LegacyStageArray:
-    def __getitem__(self, task_id: int) -> int:
-        return _LEGACY_MAX_STAGE_FALLBACK
-TASK_NUM_STAGES = _LegacyStageArray()  # duck-typed: TASK_NUM_STAGES[task_id] → 15
 from b1k.shared.correction_rules import apply_correction_rules, check_gripper_variation
-from omnigibson.learning.utils.eval_utils import PROPRIOCEPTION_INDICES
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +40,9 @@ class B1KPolicyWrapper():
         task_id: int | None = None,
         config: B1KWrapperConfig = None,
         checkpoint_switcher = None,
+        max_lang_tokens: int = 0,
+        task_prompts: dict | None = None,
+        progress_horizon: int = 1500,
     ) -> None:
         self.base_policy = policy
         self.policy = policy
@@ -66,7 +59,16 @@ class B1KPolicyWrapper():
         
         # PI_BEHAVIOR specific (always True for B1K)
         self.task_id = task_id
-        self.current_stage = 0
+        # Raw skill id fed as tokenized_prompt[1]. 0 = unknown, the same sentinel training
+        # used for frames outside any annotated segment.
+        self.current_skill_id = 0
+        # Prompt width must match the checkpoint: 0 = no-language arm.
+        self.max_lang_tokens = max_lang_tokens
+        # task_index -> rich description, only needed by the language arm.
+        self.task_prompts = task_prompts or {}
+        # Denominator for subtask_progress. Training used the true episode length; at eval
+        # that is unknown, so the step budget stands in.
+        self.progress_horizon = progress_horizon
         self.prediction_history = deque([], maxlen=self.config.history_len)
         
         # Control loop variables
@@ -84,7 +86,7 @@ class B1KPolicyWrapper():
         self.step_count = 0
         self.prediction_count = 0
         self.next_initial_actions = None
-        self.current_stage = 0
+        self.current_skill_id = 0
         self.prediction_history.clear()
         logger.info(f"Policy reset - Task ID: {self.task_id}, Action horizon: {self.action_horizon}")
     
@@ -94,7 +96,7 @@ class B1KPolicyWrapper():
             old_task_id = self.task_id
             self.task_id = new_task_id
             
-            logger.info(f"🔄 Task change detected: {old_task_id} → {new_task_id} (max stages: {TASK_NUM_STAGES[new_task_id]})")
+            logger.info(f"Task change: {old_task_id} → {new_task_id}")
             
             if self.checkpoint_switcher:
                 new_policy = self.checkpoint_switcher.get_policy_for_task(new_task_id)
@@ -104,7 +106,7 @@ class B1KPolicyWrapper():
                     self.policy = new_policy
                     self.policy.reset()
             
-            self.current_stage = 0
+            self.current_skill_id = 0
             self.prediction_history.clear()
             self.last_actions = None
             self.action_index = 0
@@ -132,53 +134,91 @@ class B1KPolicyWrapper():
         }
     
     def update_current_stage(self, predicted_subtask_logits):
-        """Update current stage using majority voting."""
+        """Track the current skill from the model's own predictions.
+
+        Replaces the 2025 stage machine. That version promoted a monotonic counter through
+        per-task time slices (TASK_NUM_STAGES), which no longer corresponds to anything the
+        model learned: B1a made stages a *global* 34-entry skill vocabulary read from the
+        annotations, and skills recur and revisit rather than advancing in order.
+
+        So: majority vote over the raw predictions, no ordering assumption. Requires
+        `votes_to_promote` agreeing samples in the recent history before switching, which
+        keeps single-frame prediction noise from flipping the conditioning every step.
+
+        predicted_subtask_logits is over the *dense* 34-way index; SKILL_IDX_TO_ID converts
+        the winner back to the raw id that tokenized_prompt[1] carries.
+        """
+        from b1k.models.pi_behavior_config import SKILL_IDX_TO_ID, SKILL_ID_TO_NAME
+
         if self.task_id is None:
             return
-            
-        max_stage = TASK_NUM_STAGES[self.task_id] - 1
-        predicted_stage = int(np.argmax(predicted_subtask_logits))
-        
-        if predicted_stage > max_stage:
-            predicted_stage = max_stage
-        
-        self.prediction_history.append(predicted_stage)
-        
-        if len(self.prediction_history) == self.config.history_len:
-            next_stage = self.current_stage + 1
-            
-            if next_stage <= max_stage:
-                votes_for_next = sum(1 for pred in self.prediction_history if pred == next_stage)
-                votes_to_skip = sum(1 for pred in self.prediction_history if pred == next_stage + 1)
-                votes_to_go_back = sum(1 for pred in self.prediction_history if pred == self.current_stage - 1)
-                
-                if votes_for_next >= self.config.votes_to_promote:
-                    old_stage = self.current_stage
-                    self.current_stage = next_stage
-                    self.prediction_history.clear()
-                    logger.info(f"⬆️  Stage advanced: {old_stage} → {self.current_stage} (task {self.task_id}, step {self.step_count})")
-                elif votes_to_skip == self.config.history_len:
-                    old_stage = self.current_stage
-                    self.current_stage = next_stage
-                    self.prediction_history.clear()
-                    logger.info(f"⏭️  Stage skipped: {old_stage} → {self.current_stage} (task {self.task_id}, step {self.step_count})")
-                elif votes_to_go_back == self.config.history_len and self.current_stage > 0:
-                    old_stage = self.current_stage
-                    self.current_stage -= 1
-                    self.prediction_history.clear()
-                    logger.info(f"⬅️  Stage went back: {old_stage} → {self.current_stage} (task {self.task_id}, step {self.step_count})")
-    
+
+        dense_idx = int(np.argmax(predicted_subtask_logits))
+        raw_id = SKILL_IDX_TO_ID.get(dense_idx, 0)
+        self.prediction_history.append(raw_id)
+
+        if len(self.prediction_history) < self.config.history_len:
+            return
+
+        counts = {}
+        for v in self.prediction_history:
+            counts[v] = counts.get(v, 0) + 1
+        winner, votes = max(counts.items(), key=lambda kv: kv[1])
+
+        if votes >= self.config.votes_to_promote and winner != self.current_skill_id:
+            old = self.current_skill_id
+            self.current_skill_id = winner
+            self.prediction_history.clear()
+            logger.info(
+                f"skill {old} ({SKILL_ID_TO_NAME.get(old, '?')}) → "
+                f"{winner} ({SKILL_ID_TO_NAME.get(winner, '?')})  "
+                f"task {self.task_id} step {self.step_count} votes {votes}/{self.config.history_len}"
+            )
+
     def prepare_batch_for_pi_behavior(self, batch):
-        """Prepare batch for PI_BEHAVIOR model by adding task_id and current_stage."""
+        """Build the model inputs exactly as training produced them.
+
+        The previous version emitted [task_id, current_stage] plus a "subtask_state" field.
+        Neither matches what the model now consumes, and both failures are quiet or fatal:
+
+        - tokenized_prompt[1] must be the *raw* skill id (sparse in 1..102); SKILL_ID_LUT
+          maps raw -> dense inside the model. current_stage was a monotonic 0,1,2 counter,
+          so it indexed skill_embeddings at the wrong row without any error.
+        - subtask_progress was never supplied at all, and the model raises
+          "subtask_progress must be provided in Observation for PI_BEHAVIOR (B1a stages)".
+        - the language arm needs 2 + max_lang_tokens entries, rebuilt with the same wording
+          training used (b1k.transforms.compose_prompt), from the *predicted* skill.
+
+        Width follows the checkpoint's own config, so one wrapper serves both A/B arms:
+        max_lang_tokens == 0 -> [task_id, skill_id]; otherwise + text tokens.
+        """
+        from b1k.models.pi_behavior_config import SKILL_ID_TO_NAME, UNKNOWN_SKILL_NAME
+
         task_id = self.task_id if self.task_id is not None else -1
         batch_copy = batch.copy()
-        if "prompt" in batch_copy:
-            del batch_copy["prompt"]
-        
-        batch_copy["tokenized_prompt"] = np.array([task_id, self.current_stage], dtype=np.int32)
-        batch_copy["tokenized_prompt_mask"] = np.array([True, True], dtype=bool)
-        batch_copy["subtask_state"] = np.array(self.current_stage, dtype=np.int32)
-        
+        batch_copy.pop("prompt", None)
+
+        skill_id = int(self.current_skill_id)
+        prompt = [task_id, skill_id]
+        mask = [True, True]
+
+        if self.max_lang_tokens > 0:
+            from b1k.transforms import compose_prompt, _get_tokenizer
+
+            desc = self.task_prompts.get(task_id, f"task {task_id}")
+            name = SKILL_ID_TO_NAME.get(skill_id, UNKNOWN_SKILL_NAME)
+            ids, m = _get_tokenizer(self.max_lang_tokens).tokenize(compose_prompt(desc, name))
+            prompt += list(np.asarray(ids, dtype=np.int32))
+            mask += list(np.asarray(m, dtype=bool))
+
+        batch_copy["tokenized_prompt"] = np.array(prompt, dtype=np.int32)
+        batch_copy["tokenized_prompt_mask"] = np.array(mask, dtype=bool)
+        # Training used current_frame / task_duration. At eval the true duration is unknown,
+        # so this is an estimate from the step budget -- it is a conditioning signal, not a
+        # label, and the model saw the full [0, 1] range during training.
+        batch_copy["subtask_progress"] = np.float32(
+            min(1.0, self.step_count / max(1, self.progress_horizon))
+        )
         return batch_copy
     
     def _interpolate_actions(self, actions, target_steps):
@@ -238,19 +278,19 @@ class B1KPolicyWrapper():
                 if self.task_id is not None:
                     actions_before = actions.copy()
                     actions, corrected_stage = apply_correction_rules(
-                        self.task_id, self.current_stage, current_state, actions
+                        self.task_id, self.current_skill_id, current_state, actions
                     )
                     
                     # Log if stage was corrected
-                    if corrected_stage != self.current_stage:
-                        logger.info(f"🔧 Correction rule: Stage corrected {self.current_stage} → {corrected_stage} (task {self.task_id}, step {self.step_count})")
-                        self.current_stage = corrected_stage
+                    if corrected_stage != self.current_skill_id:
+                        logger.info(f"correction rule changed skill {self.current_skill_id} → {corrected_stage} (task {self.task_id}, step {self.step_count})")
+                        self.current_skill_id = corrected_stage
                         self.prediction_history.clear()
                     
                     # Log if actions were modified
                     if not np.allclose(actions_before, actions, rtol=1e-3):
                         max_diff = np.max(np.abs(actions_before - actions))
-                        logger.info(f"🔧 Correction rule: Actions modified (max diff: {max_diff:.4f}, task {self.task_id}, stage {self.current_stage})")
+                        logger.info(f"correction rule modified actions (max diff {max_diff:.4f}, task {self.task_id}, skill {self.current_skill_id})")
                 
                 if should_compress:
                     has_high_variation, mean_var, max_var = check_gripper_variation(
@@ -304,7 +344,7 @@ class B1KPolicyWrapper():
         
         # Log progress every 100 steps
         if self.step_count % 100 == 0:
-            logger.info(f"📊 Step {self.step_count} | Task: {self.task_id} | Stage: {self.current_stage}/{TASK_NUM_STAGES[self.task_id]-1} | Predictions: {self.prediction_count}")
+            logger.info(f"step {self.step_count} | task {self.task_id} | skill {self.current_skill_id} | predictions {self.prediction_count}")
         
         # Convert to torch tensor
         action_tensor = torch.from_numpy(current_action).float()
