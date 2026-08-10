@@ -995,6 +995,67 @@ def _single_task_ft(task_index: int, task_name: str) -> TrainConfig:
 
 _CONFIGS += [_single_task_ft(idx, name) for idx, name in _SINGLE_TASK_FT.items()]
 
+
+# ---------------------------------------------------------------------------
+# SINGLE-TASK FINETUNES, STAGE 2 (10k -> 20k, annealing to 1e-6)
+#
+# Stage 1 ends exactly where its cosine bottoms out at 1e-5, with no constant-LR tail --
+# and that decay segment is where most of the progress happened (task 54: 0.1531 at 5000 ->
+# 0.0774 at 9520; task 56: 0.0893 -> 0.0412). Stage 2 continues the anneal for another 10k
+# steps, from 1e-5 down to 1e-6, taking the total to 20k.
+#
+# A separate config rather than a --resume with an edited schedule, so stage 1's result
+# stays on disk and reproducible. The cost is that PiBehaviorWeightLoader restores params
+# only: Adam's moment estimates start from zero, which is part of why the schedule keeps a
+# 1000-step warmup rather than jumping straight to 1e-5.
+#
+# peak_lr=1e-5 continues the anneal instead of re-warming to stage 1's 1e-4. A restart to
+# 1e-4 would bounce the loss up in exchange for a chance at a better basin, and 10k steps is
+# not obviously enough to earn that back.
+#
+# Only tasks 54 and 56 for now -- the two that have finished stage 1. Whether the other ten
+# get the same treatment depends on what these two show.
+_SINGLE_TASK_FT_S2 = {54: "putting_away_toys", 56: "make_rose_centerpieces"}
+
+_CKPT_ROOT = "/work6/markhsp/behavior-1k-solution/outputs/checkpoints"
+
+
+def _single_task_ft_s2(task_index: int, task_name: str) -> TrainConfig:
+    """Stage 2 for one task: same everything, new schedule, warm-started from stage 1.
+
+    Built by mutating the stage-1 config so the two cannot drift in the fields that must
+    match (batch, model, episodes, assets); only the four fields that define "stage 2" are
+    replaced.
+    """
+    stage1 = _single_task_ft(task_index, task_name)
+    return dataclasses.replace(
+        stage1,
+        name=f"pi_behavior_b1k_task{task_index}_ft_s2",
+        exp_name=f"{stage1.exp_name}_s2",
+        # Stage 1's final checkpoint. 10000/ is period-protected (keep_period=10_000), so it
+        # survives whatever stage 2 writes.
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            f"{_CKPT_ROOT}/{stage1.name}/{stage1.exp_name}/10000/params"
+        ),
+        # Same shape as stage 1 (1k warmup, cosine over the whole run), one decade lower at
+        # both ends of the cosine. decay_steps counts from step 0 including warmup, so this
+        # reaches decay_lr exactly at the final step -- verified against stage 1's
+        # lr@1000=1e-4, lr@10000=1e-5.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=10_000,
+            decay_lr=1e-6,
+        ),
+        # 10_001 for the same reason as stage 1: makes 10000 the last step, so the final
+        # save is both a save_interval multiple and period-protected. Note this is stage 2's
+        # own step counter -- the model has seen 20k steps total by the end.
+        num_train_steps=10_001,
+    )
+
+
+_CONFIGS += [_single_task_ft_s2(idx, name) for idx, name in _SINGLE_TASK_FT_S2.items()]
+
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
