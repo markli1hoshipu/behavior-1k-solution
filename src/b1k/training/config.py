@@ -959,7 +959,20 @@ def _single_task_ft(task_index: int, task_name: str) -> TrainConfig:
         weight_loader=weight_loaders.PiBehaviorWeightLoader(
             "/work6/markhsp/models/behavior_50t_checkpoint/params"
         ),
-        num_train_steps=20_000,
+        # Cut from 20k to end earlier. 10_001, not 10_000: the loop is
+        # range(start_step, num_train_steps), so this makes 10000 the last step, where
+        # `step % save_interval == 0` and `step == num_train_steps - 1` coincide. All twelve
+        # checkpoints are then named 10000/ and keep_period protects every one of them;
+        # num_train_steps=10_000 would have ended at 9999, which is neither a save-interval
+        # multiple nor period-protected, so it would survive only as "most recent".
+        #
+        # decay_steps stays at 10_000 even though the run now ends there, so the LR bottoms
+        # out at 1e-5 exactly as the run finishes and there is no constant-LR tail. That is
+        # a real loss -- the nolang pilot's second 10k at flat 1e-5 took action_loss from
+        # 0.0225 to 0.0188. It is deliberate: tasks 54 and 56 were already running under
+        # decay_steps=10_000 and can only be stopped, not rewound, so moving the decay for
+        # the other ten would leave the twelve models incomparable.
+        num_train_steps=10_001,
         log_interval=10,
         assets_base_dir="./outputs/assets",
         checkpoint_base_dir="./outputs/checkpoints",
