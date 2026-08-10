@@ -860,6 +860,128 @@ _CONFIGS = [
     ),
 ]
 
+
+# ---------------------------------------------------------------------------
+# SINGLE-TASK FINETUNES
+#
+# One specialist per task, to get a per-task ceiling quickly instead of waiting on a
+# 100-task run. Every task here is >= 50, i.e. new in 2026: Ilia's 50-task checkpoint has
+# never seen any of them, so task_embeddings row N starts random in all twelve.
+#
+# Sizing: a task is 200 episodes ~= 1.09M frames, so 20k x 256 = 5.12M samples ~= 4.7
+# epochs -- the same territory as the 5-task pilot's 4.3, which is what keeps this a
+# finetune rather than a memorisation test.
+#
+# Caveats, both deliberate:
+#   - LR is unchanged at peak 1e-4 while batch drops 1024 -> 256, so the per-sample step is
+#     4x hotter than the pilot's. If grad_norm blows up early, that is why.
+#   - Assets are the 5-task pilot's (tasks 0/5/40/76/77); ten of these twelve are outside
+#     that sample. The flow-matching path normalises by per-timestamp mean/std and does not
+#     clip, so out-of-distribution actions merely get larger z-scores. The FAST auxiliary
+#     does clip to [q01, q99] before tokenising, so its targets are degraded for whatever
+#     falls outside -- bounded by fast_loss_weight=0.05.
+#
+# Launch: one job per node, 8 GPUs each, two at a time.
+#   sbatch --nodes=1 --ntasks-per-node=1 scripts/train_slurm.sbatch pi_behavior_b1k_task54_ft
+# 16 devices was considered and rejected: at batch 256 that is 16 samples/GPU, where the
+# per-step FSDP all-gather of a ~3B model no longer amortises, so two 8-GPU jobs finish all
+# twelve in roughly two thirds the wall-clock of twelve sequential 16-GPU jobs.
+_SINGLE_TASK_FT = {
+    54: "putting_away_toys",
+    56: "make_rose_centerpieces",
+    59: "organizing_art_supplies",
+    70: "thawing_frozen_food",
+    73: "organizing_school_stuff",
+    74: "carrying_out_garden_furniture",
+    76: "dispose_of_glass",
+    77: "installing_a_modem",
+    85: "putting_dirty_dishes_in_sink",
+    86: "make_gift_bags_for_baby_showers",
+    87: "collecting_aluminum_cans",
+    98: "laying_tile_floors",
+}
+
+
+def _single_task_ft(task_index: int, task_name: str) -> TrainConfig:
+    """Build the finetune config for one task.
+
+    Generated rather than written out twelve times: the blocks differ only in
+    episodes_index, and hand-copying is how the two pilot arms would have drifted.
+    Episodes are laid out 200 per task in task order, so task N owns [N*200, (N+1)*200).
+    """
+    return TrainConfig(
+        name=f"pi_behavior_b1k_task{task_index}_ft",
+        # task_name is carried into exp_name so the checkpoint directory says which task it
+        # is; with twelve of these, "task74_ft" alone is not enough to read at a glance.
+        exp_name=f"task{task_index}_{task_name}",
+        project_name="B1K",
+        # Identical to pi_behavior_b1k_5task_pilot -- the language+skill arm. Keep it that
+        # way: these runs are only interpretable against that pilot.
+        model=pi_behavior_config.PiBehaviorConfig(
+            action_horizon=30,
+            action_dim=32,
+            num_tasks=100,
+            max_lang_tokens=128,
+            use_correlated_noise=True,
+            correlation_beta=0.5,
+            use_fast_auxiliary=True,
+            fast_loss_weight=0.05,
+            fast_encoded_dims="0:6,7:23",
+            fast_vocab_size=1024,
+            max_fast_tokens=200,
+            use_kv_transform=True,
+            use_knowledge_insulation=False,
+            subtask_loss_weight=0.1,
+            freeze_vision_backbone=True,
+        ),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2026-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=False,
+                behavior_dataset_root="/work6/markhsp/datasets/2026-challenge-demos-rgbonly",
+                use_per_timestamp_norm=True,
+                episodes_index=list(range(task_index * 200, (task_index + 1) * 200)),
+            ),
+            use_delta_joint_actions=True,
+            use_fast_tokenization=True,
+            annotations_dir="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos/annotations",
+            task_prompts_path="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos/meta/tasks.jsonl",
+            episodes_per_task=200,
+        ),
+        # Same shape as the pilot: 1k warmup, cosine to 1e-5 by 10k, flat 1e-5 to 20k.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-4,
+            decay_steps=10_000,
+            decay_lr=1e-5,
+        ),
+        num_flow_samples=15,
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            "/work6/markhsp/models/behavior_50t_checkpoint/params"
+        ),
+        num_train_steps=20_000,
+        log_interval=10,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        # 256 over 8 devices = 32/GPU, ~1/4 of the pilot's footprint, so nowhere near the
+        # 143.8 GB ceiling. Workers stay at 64: at ~0.39 s/sample/worker that supplies
+        # ~164 samples/s against a GPU-bound step of ~100 samples/s, so the loader keeps
+        # ahead without the RSS of 80.
+        batch_size=256,
+        num_workers=64,
+        fsdp_devices=8,
+        # save_interval divides keep_period here, unlike the pilot: saves land on 5000,
+        # 10000, 15000 and the final 19999, and 10000 is period-protected. The pilot's
+        # 2000/5000 pairing left the final checkpoint alive only as "most recent", which is
+        # how pilot_nolang/19999 was deleted when the 30k extension wrote 26000.
+        save_interval=5_000,
+        keep_period=10_000,
+        wandb_enabled=False,
+    )
+
+
+_CONFIGS += [_single_task_ft(idx, name) for idx, name in _SINGLE_TASK_FT.items()]
+
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
