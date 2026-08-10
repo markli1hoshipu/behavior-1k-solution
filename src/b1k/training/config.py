@@ -314,6 +314,10 @@ class TrainConfig:
     batch_size: int = 32
     # Number of workers to use for the data loader.
     num_workers: int = 2
+    # >0 enables ChunkStreamingSampler with this run length (set it to the video GOP).
+    # 0 = independent random frames. Only worth it on high-GOP data: the 224 rebuild keeps
+    # GOP 250, where a random frame costs ~125 decodes. Correlates samples within a batch.
+    chunk_stream_size: int = 0
     # Number of train steps (batches) to run.
     num_train_steps: int = 30_000
 
@@ -681,7 +685,10 @@ _CONFIGS = [
         # 20k x 1024 = 20.5M samples = ~4.3 epochs over the 4.79M-frame subset. Step count
         # and batch have to be chosen together: the same 20k steps at batch 2048 would be
         # ~8.6 epochs on four tasks, which measures memorisation rather than learning.
-        num_train_steps=20_000,
+        # Extended 20k -> 30k. The LR schedule already flattens at decay_lr from step 10k
+        # (optax clamps the cosine's step count), so the whole added segment runs at 1e-5
+        # without touching lr_schedule.
+        num_train_steps=30_000,
         log_interval=10,
         assets_base_dir="./outputs/assets",
         checkpoint_base_dir="./outputs/checkpoints",
@@ -693,6 +700,10 @@ _CONFIGS = [
         # 1024/80 figures was off by more than 2x, because in the 1024 case the workers
         # were partly idle waiting on the GPUs. 64 sits between the two measured points.
         num_workers=64,
+        # 224 + chunk_stream_size=250 was tried for the 20k->30k segment and wedged after
+        # 60 steps: the log went fully silent (not even the per-batch torchvision warnings)
+        # while the job stayed RUNNING. Reverted to the pipeline that carried steps 0-20k.
+        # chunk_stream_size=0,
         # 1024 over 8 devices = 128/GPU, the footprint measured at 79.5 GB of 143.8.
         # 2048 on 8 devices would be 256/GPU (~160 GB) and OOM -- that only fit when the
         # mesh spanned 16 devices. Both A/B arms must match here or the comparison is

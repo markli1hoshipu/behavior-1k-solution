@@ -8,6 +8,7 @@ import multiprocessing
 import time
 
 import jax
+import numpy as np
 import torch
 
 # Import all base data loading from OpenPI
@@ -76,6 +77,62 @@ class B1kLeRobotDataset(_LeRobotDataset):
             )
             result[key] = torch.stack(self.hf_dataset[relative_indices][key])
         return result
+
+
+class ChunkStreamingSampler(torch.utils.data.Sampler):
+    """Sample contiguous runs instead of independent random frames.
+
+    Why: JackLiu's 224 rebuild keeps the source GOP of 250, so a random frame costs ~125
+    frame-decodes (start at the preceding keyframe, decode forward). Drawing a *run* of
+    consecutive frames amortises that to roughly one decode per sample, which is the whole
+    point of Ilia's chunk_streaming_using_keyframe -- reimplemented here as a sampler
+    because their BehaviorLeRobotDataset only reads the 2025 v2.1 layout (one episode per
+    file, task id derived as episode_index // 1e4, a hardcoded 50-task table) and upstream
+    has since deleted it.
+
+    Runs never cross an episode boundary: consecutive rows of two different demonstrations
+    are unrelated, and the action-horizon window would silently blend them.
+
+    This is a change in training semantics, not just I/O. A batch now holds a few long runs
+    rather than batch_size independent draws, so samples within it are strongly correlated
+    and the effective batch is much smaller than the nominal one. Ilia ran batch 2048 with
+    this scheme; using it at a smaller batch trades gradient quality for throughput.
+    """
+
+    def __init__(self, episode_index, chunk_size: int = 250, seed: int = 0, drop_last: bool = True):
+        ep = np.asarray(episode_index)
+        # The filtered dataset keeps rows in order, so each episode occupies one contiguous
+        # span; boundaries are exactly where episode_index changes.
+        bounds = np.flatnonzero(np.diff(ep)) + 1
+        starts = np.concatenate(([0], bounds))
+        ends = np.concatenate((bounds, [len(ep)]))
+
+        self.chunks = []
+        for a, b in zip(starts, ends):
+            for c in range(a, b, chunk_size):
+                d = min(c + chunk_size, b)
+                if d > c and (not drop_last or d - c == chunk_size):
+                    self.chunks.append((c, d))
+        self.chunk_size = chunk_size
+        self.seed = seed
+        self.epoch = 0
+        self._len = sum(b - a for a, b in self.chunks)
+        logging.info(
+            f"ChunkStreamingSampler: {len(self.chunks)} chunks of {chunk_size} over "
+            f"{len(starts)} episodes, {self._len} of {len(ep)} frames reachable"
+        )
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+
+    def __len__(self) -> int:
+        return self._len
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + self.epoch)
+        for i in rng.permutation(len(self.chunks)):
+            a, b = self.chunks[i]
+            yield from range(a, b)
 
 
 class _MultiHostTorchDataLoader:
@@ -320,8 +377,19 @@ def create_behavior_data_loader(
         seed = int(time.time() * 1000) % (2**32)
         logging.info(f"Using random seed: {seed}")
     
-    dataset = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon, seed=seed)
-    dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    raw = create_behavior_dataset(data_config, action_horizon=config.model.action_horizon, seed=seed)
+
+    # Chunk streaming needs the episode layout, read straight off the Arrow column. Going
+    # through hf_dataset["episode_index"] would run the formatting transform over every row
+    # -- the same trap that made __getitem__ take 187 s (see B1kLeRobotDataset).
+    chunk_sampler = None
+    chunk_size = getattr(config, "chunk_stream_size", 0) or 0
+    if chunk_size > 0:
+        base = raw.dataset if isinstance(raw, TransformedDataset) else raw
+        ep_col = base.hf_dataset.data.column("episode_index").to_numpy(zero_copy_only=False)
+        chunk_sampler = ChunkStreamingSampler(ep_col, chunk_size=chunk_size, seed=seed)
+
+    dataset = transform_dataset(raw, data_config, skip_norm_stats=skip_norm_stats)
 
     # Multi-host data loading. openpi finished this only for the torch.distributed path:
     # its JAX branch divides the batch size by process_count but never shards the *indices*,
@@ -345,13 +413,20 @@ def create_behavior_data_loader(
                 dataset,
                 local_batch_size=local_batch_size,
                 sharding=sharding,
-                shuffle=shuffle,
+                shuffle=shuffle and chunk_sampler is None,
+                sampler=chunk_sampler,
                 num_batches=num_batches,
                 num_workers=config.num_workers,
                 seed=seed,
             ),
         )
 
+    if chunk_sampler is not None:
+        raise NotImplementedError(
+            "chunk_stream_size with multi-host is not implemented: each rank would need a "
+            "disjoint slice of the *chunk* list, not of the frame list, or the ranks would "
+            "stream overlapping runs. Run chunk streaming single-node for now."
+        )
     sampler = torch.utils.data.distributed.DistributedSampler(
         dataset,
         num_replicas=n_proc,
