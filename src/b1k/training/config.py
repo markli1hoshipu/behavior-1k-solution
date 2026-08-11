@@ -1056,6 +1056,68 @@ def _single_task_ft_s2(task_index: int, task_name: str) -> TrainConfig:
 
 _CONFIGS += [_single_task_ft_s2(idx, name) for idx, name in _SINGLE_TASK_FT_S2.items()]
 
+
+# ---------------------------------------------------------------------------
+# SINGLE-TASK, NO-LANGUAGE, 20k AT 1e-5 -> 1e-7
+#
+# A third recipe, not a continuation: trained from Ilia's 50-task checkpoint like stage 1,
+# but with the text span dropped (max_lang_tokens=0, Ilia's own 2025 design) and a single
+# gentle 20k cosine from 1e-5 down to 1e-7 instead of stage 1's 1e-4 -> 1e-5.
+#
+# Note this is three changes at once against the stage-1 runs -- language, peak LR, and
+# length -- so a difference in the result cannot be attributed to any one of them. It is a
+# new recipe to evaluate on its own merits, not an ablation.
+#
+# Task 87 has no prior checkpoint of its own, so both tasks start from the same 50-task
+# base; warm-starting 56 from its existing model would have made the pair incomparable.
+#
+# Assets differ from every other config here: the 2025 FAST tokenizer that ships with
+# behavior_50t_checkpoint, plus JackLiu0406/b1k-checkpoints norm-stats-fixed -- the 2025
+# stats with state dims 0:2 (base_qvel) replaced. The 2026 demos carry upstream e6c9756,
+# which moved base_qvel from the world frame to the robot frame, so the inherited 2025
+# std is 7-12x too small on those three dims and base_vx sits ~4.7 sigma off centre.
+# Everything else in that file is byte-identical to upstream, verified on load.
+#
+# Two consequences worth knowing before reading the loss curves:
+#   - These runs are NOT comparable with the existing task54/56 checkpoints, which trained
+#     under the five-task 2026 stats. Different input distribution, different loss scale.
+#   - The 2025 tokenizer emits far longer codes than our retrained one: mean 181 tokens,
+#     p99 658, against max_fast_tokens=200. A large fraction of FAST targets are therefore
+#     truncated and fast_accuracy will read low. This matches Ilia's own configuration
+#     (pi_behavior_b1k_100 pairs the same tokenizer with max_fast_tokens=200) and is
+#     bounded by fast_loss_weight=0.05, but it is not a neutral swap.
+_SINGLE_TASK_NOLANG = {56: "make_rose_centerpieces", 87: "collecting_aluminum_cans"}
+
+
+def _single_task_nolang(task_index: int, task_name: str) -> TrainConfig:
+    """No-language 20k variant, derived from the stage-1 config so shared fields can't drift."""
+    stage1 = _single_task_ft(task_index, task_name)
+    return dataclasses.replace(
+        stage1,
+        name=f"pi_behavior_b1k_task{task_index}_ft_nolang",
+        exp_name=f"{stage1.exp_name}_nolang",
+        # max_lang_tokens=0 drops the natural-language span from the prefix. The skill still
+        # reaches the model through skill_embeddings -- the prompt collapses to the width-2
+        # [task_id, skill_id] pair and embed_prefix skips the text block entirely.
+        model=dataclasses.replace(stage1.model, max_lang_tokens=0),
+        # decay_steps spans the whole run, so the cosine reaches 1e-7 exactly at the final
+        # step, the same shape stage 1 and stage 2 use.
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-5,
+            decay_steps=20_000,
+            decay_lr=1e-7,
+        ),
+        # 20_001 so the last step is 20000: a save_interval multiple and a keep_period
+        # multiple, so the final checkpoint is period-protected rather than merely "most
+        # recent". With keep_period=10_000 the 10000 midpoint is retained too, which is what
+        # makes this directly comparable against the existing task56 stage-1 model.
+        num_train_steps=20_001,
+    )
+
+
+_CONFIGS += [_single_task_nolang(idx, name) for idx, name in _SINGLE_TASK_NOLANG.items()]
+
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
