@@ -1071,21 +1071,26 @@ _CONFIGS += [_single_task_ft_s2(idx, name) for idx, name in _SINGLE_TASK_FT_S2.i
 # Task 87 has no prior checkpoint of its own, so both tasks start from the same 50-task
 # base; warm-starting 56 from its existing model would have made the pair incomparable.
 #
-# Assets differ from every other config here: the 2025 FAST tokenizer that ships with
-# behavior_50t_checkpoint, plus JackLiu0406/b1k-checkpoints norm-stats-fixed -- the 2025
-# stats with state dims 0:2 (base_qvel) replaced. The 2026 demos carry upstream e6c9756,
-# which moved base_qvel from the world frame to the robot frame, so the inherited 2025
-# std is 7-12x too small on those three dims and base_vx sits ~4.7 sigma off centre.
-# Everything else in that file is byte-identical to upstream, verified on load.
+# Assets are fitted per task, not shared: outputs/assets/_pertask/task<N>/, built by
+# scripts/build_task_assets.sh from that task's own 200 episodes. Both the normalisation
+# and the action codebook are fits to a distribution, and one task's distribution is far
+# narrower than a 5- or 100-task mixture.
 #
-# Two consequences worth knowing before reading the loss curves:
-#   - These runs are NOT comparable with the existing task54/56 checkpoints, which trained
-#     under the five-task 2026 stats. Different input distribution, different loss scale.
-#   - The 2025 tokenizer emits far longer codes than our retrained one: mean 181 tokens,
-#     p99 658, against max_fast_tokens=200. A large fraction of FAST targets are therefore
-#     truncated and fast_accuracy will read low. This matches Ilia's own configuration
-#     (pi_behavior_b1k_100 pairs the same tokenizer with max_fast_tokens=200) and is
-#     bounded by fast_loss_weight=0.05, but it is not a neutral swap.
+# Two things this buys, both measured rather than assumed:
+#   - The base_qvel correction becomes unnecessary. Stats computed from the 2026 demos
+#     already carry upstream e6c9756's robot-frame convention: task 87's own std on state
+#     dims 0:2 is 0.100/0.044/0.135, against 0.109/0.061/0.133 for the 100-task corrected
+#     file and 0.0094/0.0087/0.0137 for the uncorrected 2025 one.
+#   - FAST targets stop truncating. Task 87's own tokenizer compresses 18.5x with max
+#     token length 101, comfortably inside max_fast_tokens=200; the 2025 tokenizer
+#     compresses 3.6x with mean 181 and max 660, so most targets were being cut.
+#
+# The cost: models trained under different assets are not comparable on loss value, and
+# every checkpoint must carry its own assets to eval correctly. Orbax already copies the
+# asset directory into each checkpoint, so the eval side is handled.
+#
+# Order matters when rebuilding: train_fast_tokenizer loads norm_stats to normalise actions
+# before the DCT, so norm stats must exist first. build_task_assets.sh enforces this.
 _SINGLE_TASK_NOLANG = {56: "make_rose_centerpieces", 87: "collecting_aluminum_cans"}
 
 
