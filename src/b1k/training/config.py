@@ -1123,6 +1123,53 @@ def _single_task_nolang(task_index: int, task_name: str) -> TrainConfig:
 
 _CONFIGS += [_single_task_nolang(idx, name) for idx, name in _SINGLE_TASK_NOLANG.items()]
 
+
+# ---------------------------------------------------------------------------
+# TASK 56, NO LANGUAGE, 20k AT 1e-4 -> 1e-6 ON THE 2025 QVEL-FIXED ASSETS
+#
+# Same task, length, batch and no-language setting as pi_behavior_b1k_task56_ft_nolang;
+# two things differ, so a difference in outcome cannot be pinned on either alone:
+#
+#   1. The cosine runs an order of magnitude hotter at both ends -- 1e-4 to 1e-6 instead of
+#      1e-5 to 1e-7. The 1e-5 run's last 3k steps were flat inside noise (task 87, its twin,
+#      moved 0.0392 -> 0.0391 over its final 3000), so there was headroom to spend.
+#   2. Assets are the 2025 FAST tokenizer from behavior_50t_checkpoint plus
+#      JackLiu0406/b1k-checkpoints norm-stats-fixed -- the 2025 statistics with state dims
+#      0:2 (base_qvel) replaced to match the 2026 robot-frame convention -- rather than
+#      statistics and a codebook fitted to task 56 itself.
+#
+# Two things that follow, both about reading the numbers rather than about correctness:
+#   - Loss is not comparable with pi_behavior_b1k_task56_ft_nolang. Different normalisation
+#     means a different scale; only a real evaluation can rank the two.
+#   - The 2025 tokenizer emits mean 181 and max 660 tokens against max_fast_tokens=200, so
+#     most FAST targets truncate. That is Ilia's own pairing (pi_behavior_b1k_100 uses the
+#     same tokenizer with the same limit) and is bounded by fast_loss_weight=0.05, but
+#     fast_accuracy cannot be compared across tokenizers -- it is measured over a different
+#     codebook with a different sequence-length distribution.
+#
+# 20_000 x 256 = 5.12M samples over task 56's 906,431 frames = 5.6 epochs, matching the
+# other single-task runs.
+def _task56_nolang_2025() -> TrainConfig:
+    base = _single_task_nolang(56, "make_rose_centerpieces")
+    return dataclasses.replace(
+        base,
+        name="pi_behavior_b1k_task56_ft_nolang_2025",
+        exp_name=f"{base.exp_name}_2025",
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-4,
+            decay_steps=20_000,
+            decay_lr=1e-6,
+        ),
+        # 20_001 keeps the last step at 20000, both a save_interval and a keep_period
+        # multiple, so the final checkpoint is period-protected rather than merely most
+        # recent. Inherited from _single_task_nolang along with save 5000 / keep 10000.
+        num_train_steps=20_001,
+    )
+
+
+_CONFIGS += [_task56_nolang_2025()]
+
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}
