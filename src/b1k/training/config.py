@@ -477,7 +477,7 @@ _CONFIGS = [
             use_delta_joint_actions=True,
             use_fast_tokenization=True,
             annotations_dir="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos/annotations",
-            task_prompts_path="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos/meta/tasks.jsonl",
+            task_prompts_path="/shared_work/DATASETS/behavior-1k-2026-challenge-demos-meta/tasks.jsonl",
             episodes_per_task=200,
         ),
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -555,7 +555,7 @@ _CONFIGS = [
             use_delta_joint_actions=True,
             use_fast_tokenization=True,
             annotations_dir="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos/annotations",
-            task_prompts_path="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos/meta/tasks.jsonl",
+            task_prompts_path="/shared_work/DATASETS/behavior-1k-2026-challenge-demos-meta/tasks.jsonl",
             episodes_per_task=200,
         ),
         # Ilia's peak LR, decayed across the full run rather than their 20k-then-flat
@@ -659,7 +659,7 @@ _CONFIGS = [
             use_delta_joint_actions=True,
             use_fast_tokenization=True,
             annotations_dir="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos/annotations",
-            task_prompts_path="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos/meta/tasks.jsonl",
+            task_prompts_path="/shared_work/DATASETS/behavior-1k-2026-challenge-demos-meta/tasks.jsonl",
             episodes_per_task=200,
         ),
         # Ilia's peak LR, decayed across the full run rather than their 20k-then-flat
@@ -757,7 +757,7 @@ _CONFIGS = [
             use_delta_joint_actions=True,
             use_fast_tokenization=True,
             annotations_dir="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos/annotations",
-            task_prompts_path="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos/meta/tasks.jsonl",
+            task_prompts_path="/shared_work/DATASETS/behavior-1k-2026-challenge-demos-meta/tasks.jsonl",
             episodes_per_task=200,
         ),
         lr_schedule=_optimizer.CosineDecaySchedule(
@@ -816,7 +816,7 @@ _CONFIGS = [
             use_delta_joint_actions=True,
             use_fast_tokenization=True,
             annotations_dir="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos/annotations",
-            task_prompts_path="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos/meta/tasks.jsonl",
+            task_prompts_path="/shared_work/DATASETS/behavior-1k-2026-challenge-demos-meta/tasks.jsonl",
             episodes_per_task=200,
         ),
         lr_schedule=_optimizer.CosineDecaySchedule(

@@ -151,6 +151,13 @@ class B1kInputs(transforms.DataTransformFn):
         # Preserve subtask_state for PI_BEHAVIOR model
         if "subtask_state" in data:
             inputs["subtask_state"] = data["subtask_state"]
+
+        # Preserve subtask_progress: the wrapper (or the training-time
+        # AnnotateSkillFromAnnotation / TaskIndexToPromptTokens) emits this
+        # scalar; without the passthrough, pi_behavior.embed_prefix raises
+        # "subtask_progress must be provided in Observation for PI_BEHAVIOR".
+        if "subtask_progress" in data:
+            inputs["subtask_progress"] = data["subtask_progress"]
             
         # Preserve timestamp and episode_index for subtask state computation
         if "timestamp" in data:

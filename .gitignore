@@ -1,15 +1,7 @@
-__pycache__/
-*.py[cod]
+# eval workspace: ckpts, uv venv, logs — never commit
+models/
 .venv/
-.ipynb_checkpoints/
-wandb/
-data/
 outputs/
-checkpoints/
-assets/
-*.log
-.DS_Store
-*_old.py
-*_backup.py
-logs/
 *.egg-info/
+__pycache__/
+*.pyc
