@@ -1149,11 +1149,23 @@ _CONFIGS += [_single_task_nolang(idx, name) for idx, name in _SINGLE_TASK_NOLANG
 #
 # 20_000 x 256 = 5.12M samples over task 56's 906,431 frames = 5.6 epochs, matching the
 # other single-task runs.
-def _task56_nolang_2025() -> TrainConfig:
-    base = _single_task_nolang(56, "make_rose_centerpieces")
+#
+# Task 56 result, for whoever adds another task here: this schedule trailed the 1e-5 one
+# for its first 12k steps -- 0.2038 vs 0.1508 at step 1000, still behind at 12500 -- then
+# crossed at 15000 and finished 24% lower, 0.0215 against 0.0282. Expect the early curve to
+# look worse and do not stop it there. (The two also differ in assets, so the gap is not
+# attributable to the schedule alone.)
+_SINGLE_TASK_NOLANG_2025 = {
+    56: "make_rose_centerpieces",
+    85: "putting_dirty_dishes_in_sink",
+}
+
+
+def _single_task_nolang_2025(task_index: int, task_name: str) -> TrainConfig:
+    base = _single_task_nolang(task_index, task_name)
     return dataclasses.replace(
         base,
-        name="pi_behavior_b1k_task56_ft_nolang_2025",
+        name=f"pi_behavior_b1k_task{task_index}_ft_nolang_2025",
         exp_name=f"{base.exp_name}_2025",
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1000,
@@ -1168,7 +1180,7 @@ def _task56_nolang_2025() -> TrainConfig:
     )
 
 
-_CONFIGS += [_task56_nolang_2025()]
+_CONFIGS += [_single_task_nolang_2025(idx, name) for idx, name in _SINGLE_TASK_NOLANG_2025.items()]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
