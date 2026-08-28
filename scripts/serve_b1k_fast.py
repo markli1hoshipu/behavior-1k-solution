@@ -282,6 +282,17 @@ def main():
                          "Disables the wrapper's majority-vote skill update AND correction "
                          "rules that would overwrite the skill. Use to ablate the skill "
                          "signal in the prompt.")
+    ap.add_argument("--action-log-dir", type=str, default=None,
+                    help="If set, per-step actions/predictions get appended to "
+                         "<dir>/<task>_<inst>_<rollout>.jsonl. One line per act() call: "
+                         "{step, skill_id, subtask_progress, action:[23]}. "
+                         "Use with annotate_video.py to overlay predictions on the "
+                         "sampled MP4. Opt-in; disabled by default (no perf impact).")
+    ap.add_argument("--pinned-task-id", type=int, default=None,
+                    help="Freeze wrapper.task_id at this value regardless of obs['task_id']. "
+                         "Disables _handle_task_change so obs-driven task switches are ignored. "
+                         "Use to ablate task-embedding conditioning (e.g. --pinned-task-id 0 "
+                         "forces every rollout to look up task_embeddings[0], even on t45/t46).")
     args = ap.parse_args()
 
     wrapper_config = B1KWrapperConfig(
@@ -302,6 +313,22 @@ def main():
         wrapper_config=wrapper_config,
         task_checkpoint_mapping=args.task_checkpoint_mapping,
     )
+
+    # Task-pin ablation: freeze wrapper.task_id at `pinned_tid` no matter what
+    # obs['task_id'] says. Neutralises _handle_task_change so the wrapper never
+    # switches task, and pre-writes task_id so prepare_batch_for_pi_behavior
+    # emits [pinned_tid, skill_id] as the prompt. Use to ablate task-embedding
+    # conditioning (does the model still work with a wrong task row?).
+    if args.pinned_task_id is not None:
+        pinned_tid = int(args.pinned_task_id)
+        wrapper.task_id = pinned_tid
+        wrapper._handle_task_change = lambda *_a, **_kw: None
+        _orig_reset_t = wrapper.reset
+        def _reset_task_pinned():
+            _orig_reset_t()
+            wrapper.task_id = pinned_tid
+        wrapper.reset = _reset_task_pinned
+        logger.info(f"pinned task_id={pinned_tid} (obs-driven task switches disabled)")
 
     # Skill-pin ablation: freeze current_skill_id at `pinned` no matter what.
     # Three writers to current_skill_id inside wrapper: (1) reset() clears it
@@ -327,6 +354,53 @@ def main():
         wrapper.act = _act_pinned
         logger.info(f"pinned skill_id={pinned} (vote + correction-rule + reset "
                     f"overrides disabled — current_skill_id is a constant)")
+
+    # Per-step action / prediction logger. Writes one JSONL file per (task,
+    # instance, rollout) so the annotate_video.py post-processor can overlay
+    # predictions on the sampled MP4. Log dir is created lazily on first write.
+    # We hook wrapper.act to capture the outgoing action + wrapper state, and
+    # wrapper.reset to close the previous log + open the next one.
+    if args.action_log_dir:
+        os.makedirs(args.action_log_dir, exist_ok=True)
+        _log_state = {"fh": None, "step": 0}
+        def _open_new_log():
+            if _log_state["fh"]:
+                _log_state["fh"].close()
+            # File is opened lazily when we see the first obs with task_id
+            _log_state["fh"] = None
+            _log_state["step"] = 0
+        _orig_reset2 = wrapper.reset
+        def _reset_logged():
+            _open_new_log()
+            _orig_reset2()
+        wrapper.reset = _reset_logged
+        _orig_act2 = wrapper.act
+        def _act_logged(obs):
+            action = _orig_act2(obs)
+            # Open file lazily on first act after reset, once we know the task/instance
+            if _log_state["fh"] is None:
+                task = str(obs.get("task_name", obs.get("task", "unknown_task")))
+                # Best effort: derive an instance name from a "instance_id"-like key
+                inst = obs.get("instance_id")
+                if inst is None and "task_id" in obs:
+                    inst = int(obs["task_id"][0]) if hasattr(obs["task_id"], "__iter__") else int(obs["task_id"])
+                fname = f"{task}_{inst if inst is not None else 'unknown'}_step_log.jsonl"
+                _log_state["fh"] = open(os.path.join(args.action_log_dir, fname), "a")
+            # Serialise action tensor → list of floats
+            act_np = action.detach().cpu().numpy() if hasattr(action, "detach") else np.asarray(action)
+            record = {
+                "step": _log_state["step"],
+                "skill_id": int(getattr(wrapper, "current_skill_id", -1)),
+                "subtask_progress": round(min(1.0, wrapper.step_count / max(1, wrapper.progress_horizon)), 4),
+                "action": [round(float(x), 6) for x in act_np.tolist()[:23]],
+            }
+            import json as _j
+            _log_state["fh"].write(_j.dumps(record) + "\n")
+            _log_state["fh"].flush()
+            _log_state["step"] += 1
+            return action
+        wrapper.act = _act_logged
+        logger.info(f"per-step logging enabled → {args.action_log_dir}")
 
     logger.info(f"policy loaded. hostname={socket.gethostname()} port={args.port}")
 
