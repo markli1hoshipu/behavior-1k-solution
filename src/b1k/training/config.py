@@ -1182,6 +1182,377 @@ def _single_task_nolang_2025(task_index: int, task_name: str) -> TrainConfig:
 
 _CONFIGS += [_single_task_nolang_2025(idx, name) for idx, name in _SINGLE_TASK_NOLANG_2025.items()]
 
+
+# ---------------------------------------------------------------------------
+# SINGLE-TASK, NO LANGUAGE, WARM-STARTED FROM THE 100-TASK b300 CHECKPOINT
+#
+# Base is hoshipu/behavior-1k-100task-lang-b300 step 25,000 rather than Ilia's 50-task
+# checkpoint. That matters most for the conditioning tables: in the 50-task checkpoint
+# task_embeddings row 56 (and 87, and every other 2026-only activity) is random init, while
+# b300 has trained all 100 rows -- 25k steps at batch 2048 over the full 20,000-episode set,
+# about 0.25 epochs. Starting from trained rows is also why the LR no longer needs the very
+# cautious ramp the 50-task runs used.
+#
+# b300 was trained WITH language (max_lang_tokens=128); this runs it with 0. That is safe
+# structurally -- max_lang_tokens appears only in the input spec, `2 + max_lang_tokens`
+# wide, and sizes no parameter, so the PaliGemma token embedder loads and simply goes
+# unused. It is not free behaviourally: the base's representations were fitted with text
+# present, so expect the first few hundred steps to sit high while it re-adapts.
+#
+# LR is 5e-5 -> 1e-5, an order of magnitude narrower than the 1e-4 -> 1e-6 runs. Two
+# independent sources point at 5e-5: openpi's own pi05 finetune configs (pi05_libero,
+# pi05_full_droid_finetune) all use peak 5e-5, and Jack's task-56 run used 5e-5 and led
+# our 1e-4 run for its first 10k steps. Stopping the decay at 1e-5 rather than 1e-6 comes
+# from our own data -- task 87's last 3000 steps below 4e-7 moved action_loss 0.0392 to
+# 0.0391, i.e. the bottom decade bought nothing.
+#
+# NOTE the assets are still the 2025 qvel-fixed ones, NOT b300's own. Revisit once the
+# ModelScope download finishes: the weights were optimised against whatever normalisation
+# b300 trained under, and a mismatch there is exactly the failure Jack's A/B documented
+# (per-task stats pushed actions outside the FAST tokenizer's bins).
+_SINGLE_TASK_NOLANG_B300 = {56: "make_rose_centerpieces"}
+
+_B300_PARAMS = "/work6/markhsp/models/b100-lang-b300/params"
+
+
+def _single_task_nolang_b300(task_index: int, task_name: str) -> TrainConfig:
+    base = _single_task_nolang(task_index, task_name)
+    return dataclasses.replace(
+        base,
+        name=f"pi_behavior_b1k_task{task_index}_ft_nolang_b300",
+        exp_name=f"{base.exp_name}_b300",
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(_B300_PARAMS),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=5e-5,
+            decay_steps=20_000,
+            decay_lr=1e-5,
+        ),
+        num_train_steps=20_001,
+    )
+
+
+_CONFIGS += [_single_task_nolang_b300(idx, name) for idx, name in _SINGLE_TASK_NOLANG_B300.items()]
+
+
+# ---------------------------------------------------------------------------
+# SEED-VARIANCE PAIR: the same 10k recipe run twice, differing only in seed
+#
+# Every comparison in this file so far has been a single run per arm, which only means
+# something if run-to-run spread is small relative to the differences being read. Nothing
+# here has measured that spread. Two identical runs at seed 0 and seed 1 put a number on it.
+#
+# Launch (one per node, distinct exp_name so the checkpoint dirs do not collide):
+#   sbatch ... scripts/train_slurm.sbatch pi_behavior_b1k_task56_ft_nolang_10k \
+#       --seed 0 --exp-name task56_nolang_10k_s0
+#   sbatch ... scripts/train_slurm.sbatch pi_behavior_b1k_task56_ft_nolang_10k \
+#       --seed 1 --exp-name task56_nolang_10k_s1
+#
+# Setting seed explicitly also makes the runs reproducible, which the default does not:
+# config.seed defaults to None, and train.py and create_behavior_data_loader then each draw
+# their own int(time.time() * 1000) at different moments, so the JAX init RNG and the data
+# order get unrelated values that are not recorded anywhere.
+#
+# LR is 5e-5 -> 1e-5 over the full 10k, the shape settled on after openpi's own pi05
+# finetune configs (all peak 5e-5) and after task 87 showed the decade below 1e-5 buying
+# nothing. Base is the 50-task checkpoint, assets are task 56's own -- so this pair is also
+# the control for the b300 run, which differs from it only in base weights.
+def _task56_nolang_10k() -> TrainConfig:
+    base = _single_task_nolang(56, "make_rose_centerpieces")
+    return dataclasses.replace(
+        base,
+        name="pi_behavior_b1k_task56_ft_nolang_10k",
+        exp_name="task56_nolang_10k",
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=5e-5,
+            decay_steps=10_000,
+            decay_lr=1e-5,
+        ),
+        num_train_steps=10_001,
+    )
+
+
+_CONFIGS += [_task56_nolang_10k()]
+
+
+# ---------------------------------------------------------------------------
+# 30k SINGLE-TASK RUNS WARM-STARTED FROM THE 100-TASK 25k CHECKPOINT
+#
+# Base is hoshipu/behavior-1k-100task-lang-25k (ModelScope), step 25,000 of a 100-task
+# language-conditioned run at batch 2048. Verified on load: 3.41 B params,
+# task_embeddings (100, 2048), skill_embeddings (34, 1024), skill_pred_from_vlm
+# (2048, 34), and no task_stage_embeddings -- i.e. this repo's architecture, not the 2025
+# stage design. The point of using it: in the 50-task checkpoint every 2026-only activity
+# (56 and 87 among them) has a randomly initialised task_embeddings row, while here all 100
+# rows are trained.
+#
+# The base was trained WITH language (max_lang_tokens=128) and these runs use 0. Safe
+# structurally -- max_lang_tokens only sizes the input spec, `2 + max_lang_tokens` wide, and
+# no parameter -- but the base's attention was fitted with a 128-token text span present, so
+# expect the opening steps to sit high while it re-adapts.
+#
+# Assets are each task's own, NOT the base's. The base trained under the 2025 statistics
+# (norm_stats md5 c3980a7c..., confirmed against the download), so this is a real input
+# shift: 13 of 32 state dims move by more than 2x, base_qvel by about 10x. That is the
+# deliberate trade -- per-task stats put base_qvel in the robot frame the 2026 demos
+# actually use, and each task's tokenizer is fitted to its own normalised actions, so
+# nothing lands outside the codebook's bins.
+#
+# LR 5e-5 -> 3e-6 over the full 30k. Peak from openpi's own pi05 finetune configs, which
+# all use 5e-5; floor at 3e-6 rather than 1e-6 because task 87's last 3000 steps below
+# 4e-7 moved action_loss 0.0392 to 0.0391, inside the 3.5% seed noise measured by the
+# task56_nolang_10k pair.
+#
+# Run to 60_001, not 30_001. Tasks 56 and 87 were taken to 30k and then resumed to 60k, and
+# the second half paid: action_loss fell 24.8% and 21.6% respectively, six to seven times
+# the 3.5% seed noise. decay_steps stays at 30_000, so steps 30k-60k run at a flat 3e-6 --
+# optax clamps the cosine past decay_steps. Reproducing that exact LR trajectory in one run
+# is why decay_steps and num_train_steps differ here.
+#
+# Note this does NOT contradict task 87's earlier finding that its last 3000 steps below
+# 4e-7 bought nothing: 3e-6 is seven times higher and still in the useful range. The floor
+# that stops paying is somewhere between the two.
+#
+# 60_001 keeps the last step at 60000, a multiple of both save_interval and keep_period, so
+# the final checkpoint is period-protected. Six checkpoints are retained per task at 257 GB.
+_SINGLE_TASK_30K_25K = {
+    56: "make_rose_centerpieces",
+    87: "collecting_aluminum_cans",
+    70: "thawing_frozen_food",
+    73: "organizing_school_stuff",
+    98: "laying_tile_floors",
+    66: "turning_out_all_lights_before_sleep",
+}
+
+_B100_25K_PARAMS = "/work6/markhsp/models/b100-lang-25k/params"
+
+
+def _single_task_30k_25k(task_index: int, task_name: str) -> TrainConfig:
+    base = _single_task_nolang(task_index, task_name)
+    return dataclasses.replace(
+        base,
+        name=f"pi_behavior_b1k_task{task_index}_ft_nolang_25k30k",
+        exp_name=f"{base.exp_name}_25k30k",
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(_B100_25K_PARAMS),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=3e-6,
+        ),
+        num_train_steps=60_001,
+    )
+
+
+_CONFIGS += [_single_task_30k_25k(idx, name) for idx, name in _SINGLE_TASK_30K_25K.items()]
+
+
+# ---------------------------------------------------------------------------
+# TASK 77, 20k STEPS
+#
+# Task 77 is by far the smallest task in the set: 482,597 frames against 906k-2.9M for the
+# others, and 2,413 frames per episode against 4,532-14,592. At the 60k budget the others
+# use it would see 31.8 epochs, roughly twice task 56's 16.9 and six times task 73's 5.3.
+# 20k steps puts it at 10.6 epochs, between task 56 and task 70.
+#
+# The short episodes also mean this run should NOT hit the loader starvation that slowed
+# task 98 to 3.37 s/step: seeking a random frame in a 2,413-frame video is far cheaper than
+# in a 14,351-frame one. Expect the usual ~2.1 s/step, so about 12 hours.
+#
+# The cosine spans the whole run (decay_steps == 20_000) rather than reproducing the
+# 30k-cosine-then-flat-3e-6 shape the 60k runs happened to have. That shape was not designed
+# -- it came from running 30k and later deciding to extend -- so there is nothing to
+# preserve. Peak and floor are unchanged at 5e-5 and 3e-6.
+def _task77_20k() -> TrainConfig:
+    base = _single_task_nolang(77, "installing_a_modem")
+    return dataclasses.replace(
+        base,
+        name="pi_behavior_b1k_task77_ft_nolang_25k20k",
+        exp_name="task77_installing_a_modem_nolang_25k20k",
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(_B100_25K_PARAMS),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=5e-5,
+            decay_steps=20_000,
+            decay_lr=3e-6,
+        ),
+        # 20_001 keeps the last step at 20000, a multiple of both save_interval (5000) and
+        # keep_period (10000), so the final checkpoint is period-protected.
+        num_train_steps=20_001,
+    )
+
+
+_CONFIGS += [_task77_20k()]
+
+
+# ---------------------------------------------------------------------------
+# TASK 77, 20k, FROM THE 50-TASK CHECKPOINT — the control for _task77_20k
+#
+# Identical to pi_behavior_b1k_task77_ft_nolang_25k20k in every field except the base
+# weights: Ilia's 50-task checkpoint instead of the 100-task step-25000 one. Same task,
+# same per-task assets, same 5e-5 -> 3e-6 cosine over 20k, same batch 256, same no-language
+# setting. So the difference in outcome is attributable to the base and nothing else.
+#
+# Why this matters: the 25k-base runs beat everything that came before, but three things
+# changed at once (base, LR shape, step budget) and the warm-start advantage was already
+# measured decaying fast — 14% at step 1000, 9% at 2500, 3-5% by 5000, which is inside the
+# 3.5% seed noise. This isolates the base's contribution at the endpoint.
+#
+# In the 50-task checkpoint task_embeddings row 77 is randomly initialised (task 77 is
+# 2026-only), against a trained row in the 25k base. That row is the whole difference.
+#
+# Both runs leave seed at None, so each draws its own time-based seed. A difference under
+# about 3.5% between them is not evidence of anything.
+def _task77_20k_50t() -> TrainConfig:
+    ref = _task77_20k()
+    return dataclasses.replace(
+        ref,
+        name="pi_behavior_b1k_task77_ft_nolang_50t20k",
+        exp_name="task77_installing_a_modem_nolang_50t20k",
+        # _single_task_ft's default: /work6/markhsp/models/behavior_50t_checkpoint/params
+        weight_loader=_single_task_ft(77, "installing_a_modem").weight_loader,
+    )
+
+
+_CONFIGS += [_task77_20k_50t()]
+
+
+# ---------------------------------------------------------------------------
+# TASKS 45 + 46 JOINTLY, 4 EPOCHS, FROM checkpoint_2
+#
+# First joint (multi-task) single-stage run since the 5-task pilot. Both cooking tasks:
+# 45 cook_hot_dogs (1,828,971 frames) and 46 cook_bacon (1,535,909), 3,364,880 together.
+# 4 epochs is 52,576 steps at batch 256.
+#
+# Both task indices are BELOW 50, so unlike every single-task run since the pilot their
+# task_embeddings rows come pretrained from the checkpoint rather than randomly initialised.
+# checkpoint_2 is the 2025 architecture -- task_embeddings (50, 2048), task_stage_embeddings
+# (596, 1024), no skill tables -- so the loader expands the task table to 100 rows, drops the
+# stage tables, and leaves skill_embeddings / skill_pred_from_vlm at random init.
+#
+# Assets are the shared 2025 qvel-fixed set, not per-task: with two tasks in one run there is
+# no single task's statistics to fit. Two consequences carried over from earlier runs:
+#   - state dims 0:2 are corrected to the 2026 robot frame; everything else is the 2025
+#     statistics the pretrained trunk was optimised against.
+#   - the 2025 FAST tokenizer emits mean 181 and max 660 tokens against max_fast_tokens=200,
+#     so most FAST targets truncate. Bounded by fast_loss_weight=0.05, and it is Ilia's own
+#     pairing, but fast_accuracy from this run is not comparable with the per-task runs.
+#
+# Frame-uniform sampling splits the run 54.4% / 45.6% between the two tasks, close enough to
+# balanced that no per-task weighting is needed here. That does not generalise: across all
+# 100 tasks the frame counts span nearly 7x.
+#
+# save_interval divides the run into four equal parts and keep_period matches it, so every
+# saved checkpoint including the last is period-protected -- 52,576 is not a multiple of the
+# usual 5000/10000 pairing, which would have left the final one surviving only as "most
+# recent".
+def _task4546_joint_4ep() -> TrainConfig:
+    base = _single_task_nolang(45, "cook_hot_dogs")
+    data = dataclasses.replace(
+        base.data,
+        base_config=dataclasses.replace(
+            base.data.base_config,
+            episodes_index=list(range(9000, 9400)),   # tasks 45 and 46
+        ),
+    )
+    return dataclasses.replace(
+        base,
+        name="pi_behavior_b1k_task4546_joint_ck2",
+        exp_name="task4546_cook_joint_ck2",
+        data=data,
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            "/work7/jack/behavior1k/checkpoints/checkpoint_2/params"
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=5e-5,
+            decay_steps=52_576,
+            decay_lr=3e-6,
+        ),
+        num_train_steps=52_577,
+        save_interval=13_144,
+        keep_period=13_144,
+    )
+
+
+_CONFIGS += [_task4546_joint_4ep()]
+
+# 6-TASK JOINT FINETUNE FROM 50t, TASK-SKILL EMBEDDINGS, bs=1024 (node-10 paths)
+_SIX_TASK_TS = {1: "picking_up_trash", 2: "putting_away_Halloween_decorations",
+                9: "putting_up_Christmas_decorations_inside", 76: "dispose_of_glass",
+                87: "collecting_aluminum_cans", 98: "laying_tile_floors"}
+
+
+def _six_task_taskskill() -> TrainConfig:
+    base = _single_task_ft(1, "picking_up_trash")
+    eps = []
+    for t in sorted(_SIX_TASK_TS):
+        eps += list(range(t * 200, (t + 1) * 200))
+    data = dataclasses.replace(
+        base.data,
+        base_config=dataclasses.replace(
+            base.data.base_config,
+            behavior_dataset_root="/work/datasets/2026-challenge-demos-rgbonly",
+            episodes_index=eps,
+        ),
+        annotations_dir="/work/datasets/behavior-1k-demos/annotations",
+        task_prompts_path="/work/datasets/behavior-1k-demos/meta/tasks.jsonl",
+    )
+    return dataclasses.replace(
+        base,
+        name="pi_behavior_b1k_6task_taskonly",
+        exp_name="6task_1_2_9_76_87_98_taskonly_meta100_bs1024",
+        data=data,
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            "/work/models/behavior_submission/checkpoint_2/params"
+        ),
+        batch_size=1024,
+        num_train_steps=25_986,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000, peak_lr=1e-4, decay_steps=25_986, decay_lr=1e-5,
+        ),
+        save_interval=5_000,
+        keep_period=10_000,
+    )
+
+
+_CONFIGS += [_six_task_taskskill()]
+
+# SINGLE-TASK 16 (moving_boxes_to_storage), TASK-ONLY, meta100 base, bs=448 (64/GPU x7), 2 epochs
+def _task16_taskonly() -> TrainConfig:
+    base = _single_task_ft(16, "moving_boxes_to_storage")  # episodes 3200-3400, model config
+    data = dataclasses.replace(
+        base.data,
+        base_config=dataclasses.replace(
+            base.data.base_config,
+            behavior_dataset_root="/work/datasets/2026-challenge-demos-rgbonly",
+        ),
+        annotations_dir="/work/datasets/behavior-1k-demos/annotations",
+        task_prompts_path="/work/datasets/behavior-1k-demos/meta/tasks.jsonl",
+    )
+    return dataclasses.replace(
+        base,
+        name="pi_behavior_b1k_task16_taskonly",
+        exp_name="task16_moving_boxes_taskonly_meta100_bs448_7gpu",
+        data=data,
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            "/work/models/behavior_submission/checkpoint_2/params"
+        ),
+        batch_size=512,
+        fsdp_devices=8,
+        # task 16 = 2,919,245 frames; 2 epochs at bs=448 = 13033 steps
+        num_train_steps=15000,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000, peak_lr=1e-4, decay_steps=15000, decay_lr=1e-5,
+        ),
+        save_interval=2000,
+        keep_period=6000,
+    )
+
+
+_CONFIGS += [_task16_taskonly()]
+
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
     raise ValueError("Config names must be unique.")
 _CONFIGS_DICT = {config.name: config for config in _CONFIGS}

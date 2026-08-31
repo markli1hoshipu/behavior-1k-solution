@@ -152,8 +152,10 @@ class PiBehavior(_model.BaseModel):
         # Global skill embeddings (B1a): NUM_SKILLS=34 entries, shared across tasks so
         # "grasp" means the same thing in task 5 and task 50. Replaces per-task
         # task_stage_embeddings (was 596 rows keyed by task-relative stage index).
-        self.skill_embeddings = nnx.Embed(
-            num_embeddings=NUM_SKILLS,
+        # Task-only embeddings: one embedding per task (indexed by task_id). A single
+        # task has exactly one embedding, independent of the current skill.
+        self.task_only_embeddings = nnx.Embed(
+            num_embeddings=config.num_tasks,
             features=self.subtask_encoding_dim,
             rngs=rngs,
         )
@@ -437,6 +439,7 @@ class PiBehavior(_model.BaseModel):
     def fuse_task_and_subtask(
         self,
         task_embedding: at.Float[at.Array, "b d"],
+        task_ids: at.Int[at.Array, " b"],
         skill_idx: at.Int[at.Array, " b"],
         subtask_progress: at.Float[at.Array, " b"],
     ) -> at.Float[at.Array, "b n d"]:
@@ -453,7 +456,7 @@ class PiBehavior(_model.BaseModel):
         sincos_encoding = self.encode_progress(subtask_progress)  # [b, 1024]
 
         # Global skill embedding lookup (was: per-task task_stage_embeddings[offset+stage])
-        skill_embedding = self.skill_embeddings(skill_idx)  # [b, 1024]
+        skill_embedding = self.task_only_embeddings(task_ids)  # [b, 1024] (task-only)
 
         # Concat inputs: task (2048) + sincos (1024) + skill (1024) = 4096
         all_inputs = jnp.concatenate([
@@ -566,7 +569,7 @@ class PiBehavior(_model.BaseModel):
                     "subtask_progress must be provided in Observation for PI_BEHAVIOR (B1a stages)."
                 )
             fused_task_embeddings = self.fuse_task_and_subtask(
-                base_task_embedding, skill_idx, obs.subtask_progress
+                base_task_embedding, task_ids, skill_idx, obs.subtask_progress
             )  # [B, 4, D]
 
             task_sequence = jnp.concatenate([

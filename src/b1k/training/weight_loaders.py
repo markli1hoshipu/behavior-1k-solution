@@ -72,7 +72,7 @@ class PiBehaviorWeightLoader(WeightLoader):
             # After adaptation, obsolete keys are removed and new-init keys remain in
             # `params`. Use missing_regex to permit the new-init entries.
             missing_regex = (
-                ".*skill_embeddings.*|"
+                ".*task_only_embeddings.*|"
                 ".*skill_pred_from_vlm.*"
             )
             return _merge_params(loaded_params, params, missing_regex=missing_regex)
@@ -84,7 +84,7 @@ class PiBehaviorWeightLoader(WeightLoader):
             missing_regex = (
                 ".*task_embeddings.*|"
                 ".*skill_pred_from_vlm.*|"
-                ".*skill_embeddings.*|"
+                ".*task_only_embeddings.*|"
                 ".*gate_sincos.*|"
                 ".*gate_task_stage.*|"
                 ".*gate_task.*|"

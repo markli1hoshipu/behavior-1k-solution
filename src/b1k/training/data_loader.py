@@ -311,7 +311,7 @@ def create_behavior_dataset(data_config: _config.DataConfig, action_horizon: int
         },
         # Standard LeRobot loader — leaves task-name filtering / annotation loading to
         # our downstream transforms (task_index is present in the parquet).
-        tolerance_s=0.1,
+        tolerance_s=0.2,
         video_backend="pyav",  # pyav is more forgiving on ffmpeg shared lib version mismatches
     )
 
