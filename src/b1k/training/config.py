@@ -607,6 +607,68 @@ _CONFIGS = [
         fsdp_devices=8,
         wandb_enabled=False,
     ),
+    # TASK16-TASKONLY: single-task variant of pi_behavior_b1k_5task_pilot, restricted to
+    # task 16 (moving_boxes_to_storage). Same architecture and data pipeline; the only
+    # substantive change is episodes_index -> just task 16's 200 warm-start demos
+    # (indices 3200-3399, per the task_index * 200 convention). Registered so that
+    # b1k_solution_taskonly/scripts/serve_b1k_fast.py can look up the config by name
+    # when serving the hoshipu_task16_moving_boxes checkpoint.
+    TrainConfig(
+        name="pi_behavior_b1k_task16_taskonly",
+        exp_name="task16_taskonly",
+        project_name="B1K",
+        model=pi_behavior_config.PiBehaviorConfig(
+            action_horizon=30,
+            action_dim=32,
+            num_tasks=100,
+            max_lang_tokens=128,
+            use_correlated_noise=True,
+            correlation_beta=0.5,
+            use_fast_auxiliary=True,
+            fast_loss_weight=0.05,
+            fast_encoded_dims="0:6,7:23",
+            fast_vocab_size=1024,
+            max_fast_tokens=200,
+            use_kv_transform=True,
+            use_knowledge_insulation=False,
+            subtask_loss_weight=0.1,
+            freeze_vision_backbone=True,
+        ),
+        data=LeRobotB1KDataConfig(
+            repo_id="behavior-1k/2026-challenge-demos",
+            base_config=DataConfig(
+                prompt_from_task=False,
+                behavior_dataset_root="/work6/markhsp/datasets/2026-challenge-demos-rgbonly",
+                use_per_timestamp_norm=True,
+                episodes_index=list(range(3200, 3400)),  # task 16 moving_boxes_to_storage
+            ),
+            use_delta_joint_actions=True,
+            use_fast_tokenization=True,
+            annotations_dir="/work6/markhsp/datasets/behavior-1k-2026-challenge-demos/annotations",
+            task_prompts_path="/shared_work/DATASETS/behavior-1k-2026-challenge-demos-meta/tasks.jsonl",
+            episodes_per_task=200,
+        ),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1000,
+            peak_lr=1e-4,
+            decay_steps=10_000,
+            decay_lr=1e-5,
+        ),
+        num_flow_samples=15,
+        weight_loader=weight_loaders.PiBehaviorWeightLoader(
+            "/work6/markhsp/models/behavior_50t_checkpoint/params"
+        ),
+        num_train_steps=20_000,
+        log_interval=10,
+        assets_base_dir="./outputs/assets",
+        checkpoint_base_dir="./outputs/checkpoints",
+        num_workers=64,
+        batch_size=1024,
+        save_interval=2000,
+        keep_period=5_000,
+        fsdp_devices=8,
+        wandb_enabled=False,
+    ),
     # PILOT-5TASK-NOLANG: the A/B counterpart to pi_behavior_b1k_5task_pilot, identical
     # in every field except max_lang_tokens=0, which drops the natural-language span from
     # the prefix and leaves the task identified only by its task_embeddings row -- i.e.
